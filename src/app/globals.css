@@ -1,0 +1,146 @@
+:root {
+  color-scheme: light dark;
+  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background-color: #0f172a;
+  color: #f8fafc;
+}
+
+a {
+  color: inherit;
+}
+
+button {
+  font: inherit;
+}
+
+.page {
+  display: flex;
+  justify-content: center;
+  padding: 56px 16px;
+}
+
+.container {
+  width: min(960px, 100%);
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  border-radius: 18px;
+  padding: 40px clamp(24px, 4vw, 48px);
+  box-shadow: 0 30px 60px -40px rgba(15, 23, 42, 0.8);
+  backdrop-filter: blur(12px);
+}
+
+.hero {
+  text-align: center;
+  margin-bottom: 36px;
+}
+
+.hero h1 {
+  font-size: clamp(2.25rem, 2.5vw + 1.5rem, 3rem);
+  margin-bottom: 12px;
+}
+
+.hero p {
+  margin: 0 auto;
+  max-width: 540px;
+  color: rgba(226, 232, 240, 0.8);
+}
+
+.form {
+  display: grid;
+  gap: 20px;
+}
+
+fieldset {
+  display: grid;
+  gap: 12px;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+label {
+  font-weight: 600;
+}
+
+input[type="text"],
+input[type="number"] {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(15, 23, 42, 0.6);
+  color: inherit;
+}
+
+input[type="file"] {
+  width: 100%;
+}
+
+.button-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+button[type="submit"] {
+  padding: 12px 20px;
+  border-radius: 999px;
+  border: none;
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+button[type="submit"]:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 16px 30px -20px rgba(99, 102, 241, 0.8);
+}
+
+button[type="submit"][disabled] {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.status {
+  font-size: 0.95rem;
+  color: rgba(148, 163, 184, 0.8);
+}
+
+.status.error {
+  color: #fca5a5;
+}
+
+.topic-grid {
+  display: grid;
+  gap: 16px;
+  margin-top: 28px;
+}
+
+.topic-card {
+  padding: 18px;
+  border-radius: 14px;
+  background: rgba(30, 41, 59, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.topic-card h3 {
+  margin-top: 0;
+  margin-bottom: 10px;
+  font-size: 1.1rem;
+}
+
+.topic-card p {
+  margin: 0;
+  color: rgba(226, 232, 240, 0.85);
+}
