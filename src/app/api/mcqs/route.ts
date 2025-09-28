@@ -1,14 +1,28 @@
 import { NextRequest, NextResponse } from "next/server";
+import {
+  validateTopics,
+  type McqValidatorSummary,
+  type TopicValidationPayload,
+  type ReplacementMcq,
+} from "@/lib/anthropic";
 import { getOpenAIClient } from "@/lib/openai";
+import {
+  type JobPayload,
+  type JobRecord,
+  type JobStatus,
+  type TopicSummary,
+  getJobStore,
+} from "./jobStore";
 
 const MODEL = "gpt-4.1";
+const MAX_VALIDATION_ATTEMPTS = 2;
 
 const MCQ_RUBRIC = `You are a K–12 curriculum expert and assessment designer.
 
 Goal: Generate high-quality MCQs strictly from the provided book PDF.
 
 Quantity per topic
-- Produce 10–20 MCQs (decide by topic size/complexity).
+- Produce 10–15 MCQs (decide by topic size/complexity).
 - Keep questions varied and non-redundant.
 
 Diverse types (mix across the set)
@@ -58,11 +72,6 @@ Formatting & schema (JSON only)
   ]
 }`;
 
-interface TopicSummary {
-  topic: string;
-  description: string;
-}
-
 interface McqItem {
   bloom: string;
   difficulty: string;
@@ -71,6 +80,7 @@ interface McqItem {
   correct_index: number;
   explanation: string;
   type: string;
+  source_spans?: Array<{ page: number | null; text_snippet: string }>;
 }
 
 const CSV_HEADERS = [
@@ -85,6 +95,68 @@ const CSV_HEADERS = [
 ] as const;
 
 const LETTERS = ["A", "B", "C", "D"];
+
+const jobStore = getJobStore();
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getErrorStatus(error: unknown): number | null {
+  if (!error) {
+    return null;
+  }
+
+  const candidate = error as { status?: unknown; response?: { status?: unknown } };
+
+  if (typeof candidate.status === "number") {
+    return candidate.status;
+  }
+
+  if (candidate.response && typeof candidate.response.status === "number") {
+    return candidate.response.status;
+  }
+
+  return null;
+}
+
+interface RetryOptions {
+  label?: string;
+  log?: (...args: unknown[]) => void;
+  maxAttempts?: number;
+  initialDelayMs?: number;
+}
+
+async function retryWithBackoff<T>(task: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+  const { label, log } = options;
+  const maxAttempts = options.maxAttempts ?? 5;
+  let delay = options.initialDelayMs ?? 2000;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await task();
+    } catch (error) {
+      const status = getErrorStatus(error);
+
+      if (status === 429 && attempt < maxAttempts) {
+        if (log) {
+          log(
+            `${label ?? "Retryable task"} hit 429. Waiting ${Math.round(delay / 1000)}s before retry ${
+              attempt + 1
+            }/${maxAttempts}.`,
+          );
+        }
+        await sleep(delay);
+        delay *= 2;
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw new Error(`${label ?? "Retryable task"} exhausted all retry attempts.`);
+}
 
 function buildInstructionPrompt(
   topic: TopicSummary,
@@ -108,7 +180,8 @@ function buildJsonSchema() {
     properties: {
       mcqs: {
         type: "array",
-        minItems: 1,
+        minItems: 10,
+        maxItems: 15,
         items: {
           type: "object",
           additionalProperties: false,
@@ -230,7 +303,9 @@ function rebalanceCorrectOptions(
     }
 
     const originalIndex =
-      typeof mcq.correct_index === "number" && mcq.correct_index >= 0 && mcq.correct_index < options.length
+      typeof mcq.correct_index === "number" &&
+      mcq.correct_index >= 0 &&
+      mcq.correct_index < options.length
         ? mcq.correct_index
         : 0;
     const correctOption = options[originalIndex] ?? "";
@@ -262,6 +337,72 @@ function rebalanceCorrectOptions(
 
 type OpenAIClient = NonNullable<ReturnType<typeof getOpenAIClient>>;
 
+function cloneMcqItem(item: McqItem): McqItem {
+  return {
+    ...item,
+    options: [...item.options],
+    source_spans: item.source_spans?.map((span) => ({ ...span })),
+  };
+}
+
+function normalizeReplacementMcq(replacement: ReplacementMcq, fallback: McqItem): McqItem {
+  const options = Array.isArray(replacement.options)
+    ? [...replacement.options]
+    : [...fallback.options];
+
+  while (options.length < 4) {
+    options.push("");
+  }
+
+  const correctIndex =
+    typeof replacement.correct_index === "number" &&
+    replacement.correct_index >= 0 &&
+    replacement.correct_index <= 3
+      ? replacement.correct_index
+      : fallback.correct_index;
+
+  const normalizedSpans = (() => {
+    if (replacement.source_spans && replacement.source_spans.length > 0) {
+      return replacement.source_spans.map((span) => ({
+        page: typeof span.page === "number" ? span.page : null,
+        text_snippet: span.text_snippet ?? "",
+      }));
+    }
+
+    if (replacement.sources && replacement.sources.length > 0) {
+      return replacement.sources.map((span) => ({
+        page:
+          typeof span.page === "number"
+            ? span.page
+            : span.page === null || span.page === undefined
+              ? null
+              : Number.parseInt(String(span.page), 10) || null,
+        text_snippet: span.text_snippet ?? "",
+      }));
+    }
+
+    return fallback.source_spans;
+  })();
+
+  return {
+    ...fallback,
+    bloom: replacement.bloom ?? fallback.bloom,
+    difficulty: replacement.difficulty ?? fallback.difficulty,
+    type: replacement.type ?? fallback.type,
+    stem: replacement.stem ?? fallback.stem,
+    options,
+    correct_index: correctIndex,
+    explanation: replacement.explanation ?? fallback.explanation,
+    source_spans: normalizedSpans,
+  };
+}
+
+interface OpenAiUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+}
+
 async function generateMcqsForTopic(options: {
   openai: OpenAIClient;
   topic: TopicSummary;
@@ -270,7 +411,7 @@ async function generateMcqsForTopic(options: {
   vectorStoreId: string;
   topicIndex: number;
   totalTopics: number;
-}) {
+}): Promise<{ mcqs: McqItem[]; usage?: OpenAiUsage }> {
   const { openai, topic, chapterNumber, chapterTitle, vectorStoreId, topicIndex, totalTopics } = options;
 
   const instructions = buildInstructionPrompt(topic, chapterNumber, chapterTitle, topicIndex, totalTopics);
@@ -329,7 +470,246 @@ async function generateMcqsForTopic(options: {
     throw new Error(`Model did not return any MCQs for topic "${topic.topic}".`);
   }
 
-  return mcqs;
+  const usage = response.usage as OpenAiUsage | undefined;
+
+  return { mcqs, usage };
+}
+
+function logJob(record: JobRecord, jobId: string, ...args: unknown[]) {
+  const message = `[job ${jobId}] ${args.join(" ")}`;
+  console.log(message);
+  record.logs.push(message);
+  record.updatedAt = Date.now();
+}
+
+async function processJob(jobId: string, record: JobRecord): Promise<void> {
+  record.status = "processing";
+  record.updatedAt = Date.now();
+
+  const log = (...args: unknown[]) => logJob(record, jobId, ...args);
+  log("Processing started.");
+
+  try {
+    const { chapterNumber, chapterTitle, topics, vectorStoreId } = record.payload;
+
+    const openai = getOpenAIClient();
+    if (!openai) {
+      throw new Error("OPENAI_API_KEY is not configured on the server.");
+    }
+
+    const generatedTopics: Array<{ topic: string; items: McqItem[] }> = [];
+
+    for (const [index, topic] of topics.entries()) {
+      const { mcqs, usage } = await retryWithBackoff(
+        async () =>
+          generateMcqsForTopic({
+            openai,
+            topic,
+            chapterNumber,
+            chapterTitle,
+            vectorStoreId,
+            topicIndex: index,
+            totalTopics: topics.length,
+          }),
+        {
+          label: `OpenAI generation for topic "${topic.topic}"`,
+          log,
+          initialDelayMs: 5000,
+          maxAttempts: 6,
+        },
+      );
+
+      log(
+        `Generated ${mcqs.length} MCQs for topic "${topic.topic}" (${index + 1}/${topics.length}).` +
+          (usage
+            ? ` Tokens — input: ${usage.input_tokens ?? 0}, output: ${usage.output_tokens ?? 0}, total: ${usage.total_tokens ?? (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0)}`
+            : ""),
+      );
+
+      if (usage) {
+        record.openAiUsage.inputTokens += usage.input_tokens ?? 0;
+        record.openAiUsage.outputTokens += usage.output_tokens ?? 0;
+        record.openAiUsage.totalTokens += usage.total_tokens
+          ?? (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0);
+      }
+
+      generatedTopics.push({ topic: topic.topic, items: mcqs.map((item) => cloneMcqItem(item)) });
+    }
+
+    let currentTopics = generatedTopics.map((topic) => ({
+      topic: topic.topic,
+      items: topic.items.map((item) => cloneMcqItem(item)),
+    }));
+
+    const failedTopicSummaries: McqValidatorSummary["topicSummaries"] = [];
+
+    for (let attempt = 1; attempt <= MAX_VALIDATION_ATTEMPTS; attempt += 1) {
+      const payload: TopicValidationPayload[] = currentTopics.map((currentTopic) => ({
+        topic: currentTopic.topic,
+        questions: currentTopic.items.map((item, index) => ({
+          index,
+          stem: item.stem,
+          options: item.options,
+          correctLetter: LETTERS[item.correct_index] ?? "A",
+          explanation: item.explanation,
+          sourceSnippet: item.source_spans?.[0]?.text_snippet ?? null,
+          bloom: item.bloom,
+          difficulty: item.difficulty,
+          type: item.type,
+        })),
+      }));
+
+      log(`Validation attempt ${attempt} started.`);
+      const { summary: validationSummary, usageTotals: anthUsage } = await retryWithBackoff(
+        () => validateTopics(payload),
+        {
+          label: `Anthropic validation attempt ${attempt}`,
+          log,
+          initialDelayMs: 5000,
+          maxAttempts: 6,
+        },
+      );
+
+      record.anthropicUsage.inputTokens += anthUsage.inputTokens;
+      record.anthropicUsage.outputTokens += anthUsage.outputTokens;
+      record.anthropicUsage.totalTokens += anthUsage.totalTokens;
+
+      log(
+        `Validation attempt ${attempt} token usage — input: ${anthUsage.inputTokens}, output: ${anthUsage.outputTokens}, total: ${anthUsage.totalTokens}.`,
+      );
+
+      const rejectedTopics = validationSummary.topicSummaries.filter((topicSummary) =>
+        topicSummary.verdicts.some((verdict) => verdict.verdict === "reject"),
+      );
+
+      if (rejectedTopics.length === 0) {
+        log(`Validation attempt ${attempt} succeeded.`);
+        record.summary = validationSummary;
+        failedTopicSummaries.length = 0;
+        break;
+      }
+
+      let replacedAny = false;
+
+      validationSummary.topicSummaries.forEach((topicSummary, topicIndex) => {
+        topicSummary.verdicts.forEach((verdict) => {
+          if (verdict.verdict === "reject") {
+            if (!verdict.replacementMcq) {
+              failedTopicSummaries.push(topicSummary);
+              return;
+            }
+
+            const bucket = currentTopics[topicIndex];
+            const fallback = bucket.items[verdict.index];
+            bucket.items[verdict.index] = normalizeReplacementMcq(
+              verdict.replacementMcq,
+              fallback,
+            );
+            replacedAny = true;
+            log(
+              `Applied replacement for topic "${topicSummary.topic}" question ${verdict.index}.`,
+            );
+          }
+        });
+      });
+
+      if (!replacedAny) {
+        log("Validation failed without any provided replacements for at least one topic.");
+        failedTopicSummaries.push(...rejectedTopics);
+        break;
+      }
+    }
+
+    const successfulTopics = currentTopics.filter((topic) =>
+      !failedTopicSummaries.some((failed) => failed.topic === topic.topic),
+    );
+
+    if (successfulTopics.length === 0) {
+      record.status = "failed";
+      record.summary = {
+        overallStatus: "rejected",
+        topicSummaries: failedTopicSummaries,
+      };
+      record.error = "All topics failed validation.";
+      log(record.error);
+      return;
+    }
+
+    if (failedTopicSummaries.length > 0) {
+      log(
+        `Validation completed with ${failedTopicSummaries.length} topic(s) requiring manual review.`,
+      );
+    }
+
+    const correctCounts = [0, 0, 0, 0];
+    const rows: Array<{ topic: string; item: McqItem }> = [];
+
+    successfulTopics.forEach((topicBucket) => {
+      const balanced = rebalanceCorrectOptions(topicBucket.items, correctCounts);
+      topicBucket.items = balanced;
+      balanced.forEach((item) => {
+        rows.push({ topic: topicBucket.topic, item });
+      });
+    });
+
+    const csv = `\ufeff${toCsv(rows)}`;
+
+    record.resultCsv = csv;
+    record.summary = {
+      overallStatus: failedTopicSummaries.length === 0 ? "approved" : "mixed",
+      topicSummaries: failedTopicSummaries.length === 0 ? [] : failedTopicSummaries,
+    };
+    record.outputFilename = `chapter-${record.payload.chapterNumber}-mcqs.csv`;
+    record.status = failedTopicSummaries.length === 0 ? "succeeded" : "succeeded";
+    record.error = failedTopicSummaries.length === 0
+      ? undefined
+      : "One or more topics require manual review.";
+    record.updatedAt = Date.now();
+    log(
+      `Total OpenAI tokens used: input ${record.openAiUsage.inputTokens}, output ${record.openAiUsage.outputTokens}, total ${record.openAiUsage.totalTokens}.`,
+    );
+    log(
+      `Total Anthropic tokens used: input ${record.anthropicUsage.inputTokens}, output ${record.anthropicUsage.outputTokens}, total ${record.anthropicUsage.totalTokens}.`,
+    );
+    log(
+      failedTopicSummaries.length === 0
+        ? "Job completed successfully."
+        : "Job completed partially; some topics need manual review.",
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unexpected MCQ generation failure.";
+    console.error(`[job ${jobId}]`, error);
+    record.status = "failed";
+    record.error = message;
+    record.updatedAt = Date.now();
+    log("Job failed:", message);
+    log(
+      `Total OpenAI tokens used before failure: input ${record.openAiUsage.inputTokens}, output ${record.openAiUsage.outputTokens}, total ${record.openAiUsage.totalTokens}.`,
+    );
+    log(
+      `Total Anthropic tokens used before failure: input ${record.anthropicUsage.inputTokens}, output ${record.anthropicUsage.outputTokens}, total ${record.anthropicUsage.totalTokens}.`,
+    );
+  }
+}
+
+function createJob(payload: JobPayload): JobRecord {
+  const jobId = crypto.randomUUID();
+  const now = Date.now();
+
+  const record: JobRecord = {
+    id: jobId,
+    status: "pending",
+    payload,
+    createdAt: now,
+    updatedAt: now,
+    logs: [],
+    summary: null,
+    openAiUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    anthropicUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+  };
+
+  jobStore.set(jobId, record);
+  return record;
 }
 
 export async function POST(request: NextRequest) {
@@ -341,11 +721,13 @@ export async function POST(request: NextRequest) {
       chapterTitle,
       topics,
       vectorStoreId,
+      bookFingerprint = null,
     }: {
       chapterNumber: number;
       chapterTitle: string;
       topics: TopicSummary[];
       vectorStoreId: string;
+      bookFingerprint?: string | null;
     } = body ?? {};
 
     if (!Array.isArray(topics) || topics.length === 0) {
@@ -364,41 +746,23 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Chapter title is required." }, { status: 400 });
     }
 
-    const openai = getOpenAIClient();
-    if (!openai) {
-      return NextResponse.json({ error: "OPENAI_API_KEY is not configured on the server." }, { status: 500 });
-    }
+    const payload: JobPayload = {
+      chapterNumber,
+      chapterTitle,
+      topics,
+      vectorStoreId,
+      bookFingerprint,
+    };
 
-    const rows: Array<{ topic: string; item: McqItem }> = [];
-    const correctCounts = [0, 0, 0, 0];
+    const record = createJob(payload);
+    const jobId = record.id;
 
-    for (const [index, topic] of topics.entries()) {
-      const mcqsForTopic = await generateMcqsForTopic({
-        openai,
-        topic,
-        chapterNumber,
-        chapterTitle,
-        vectorStoreId,
-        topicIndex: index,
-        totalTopics: topics.length,
-      });
+    record.status = "pending";
+    record.updatedAt = Date.now();
 
-      const balancedItems = rebalanceCorrectOptions(mcqsForTopic, correctCounts);
+    void processJob(jobId, record);
 
-      for (const item of balancedItems) {
-        rows.push({ topic: topic.topic, item });
-      }
-    }
-
-    const csv = `\ufeff${toCsv(rows)}`;
-
-    return new NextResponse(csv, {
-      status: 200,
-      headers: {
-        "Content-Type": "text/csv; charset=utf-8",
-        "Content-Disposition": `attachment; filename="chapter-${chapterNumber}-mcqs.csv"`,
-      },
-    });
+    return NextResponse.json({ jobId });
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Unable to create MCQs at this time.";

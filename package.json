@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "jsonrepair": "^3.6.1",
     "next": "15.5.4",
     "openai": "^4.85.1",
     "react": "19.1.0",

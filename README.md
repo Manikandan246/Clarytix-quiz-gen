@@ -11,9 +11,10 @@ This package hosts a prototype service for topic generation from book chapters u
 ## High-Level Architecture
 
 1. **Web UI (Next.js App Router)** – collects the PDF, chapter metadata, and displays generated topics.
-2. **API Route (`app/api/topics`)** – uploads (or reuses a cached upload of) the PDF with OpenAI's file storage and then orchestrates a structured Responses API call backed by the file-search tool so only relevant chapter content is retrieved.
-3. **API Route (`app/api/mcqs`)** – takes the generated topics and asks OpenAI to create MCQs that satisfy the rubric, returning a downloadable CSV.
-4. **OpenAI SDK Wrapper (`lib/openai.ts`)** – centralizes client instantiation and environment handling.
+2. **API Route (`app/api/topics`)** – uploads (or reuses a cached upload of) the PDF with OpenAI's file storage and then orchestrates a structured Responses API call backed by the file-search tool so only relevant chapter content is retrieved (aiming for 3–8 topics per chapter).
+3. **API Route (`app/api/mcqs`)** – queues MCQ generation/validation jobs and stores the resulting CSV once Claude approves the questions.
+4. **API Route (`app/api/validate`)** – sends generated MCQs to Claude for automated verification before they are stored or surfaced.
+5. **OpenAI SDK Wrapper (`lib/openai.ts`)** – centralizes client instantiation and environment handling.
 
 ## Implementation Notes
 
@@ -21,8 +22,11 @@ This package hosts a prototype service for topic generation from book chapters u
 - Uploads are cached in-memory for one hour to avoid repeatedly re-ingesting the same book during a session.
 - File-search keeps Responses well below token-per-minute limits by letting the model retrieve only the relevant chapter excerpts.
 - The frontend surfaces request states (idle, loading, error) and renders the topic list.
-- MCQ generation uses the same vector store for retrieval, producing a dedicated question set for each suggested topic and streaming the combined results back as a CSV download.
+- MCQ generation now queues an asynchronous job (`POST /api/mcqs`), producing a dedicated question set (10–15 MCQs per topic) and storing the CSV server-side until validation finishes.
+- The UI polls `/api/mcqs/status?jobId=…` and downloads the CSV from `/api/mcqs/result?jobId=…` when Claude approval completes.
+- A validator endpoint integrates with Claude; MCQs are cross-checked per topic in batches. Rejected questions are automatically rewritten by the validator before CSV export, and server logs capture each replacement for troubleshooting.
 - Environment variable: `OPENAI_API_KEY` must be configured before running the app.
+- Environment variable: `ANTHROPIC_API_KEY` must be configured to enable MCQ validation.
 
 ## Next Steps
 

@@ -4,7 +4,9 @@ import {
   type ChangeEvent,
   type FormEvent,
   useCallback,
+  useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -14,6 +16,8 @@ interface Topic {
 }
 
 const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB limit for safety.
+
+type JobStatus = "pending" | "processing" | "succeeded" | "failed";
 
 export default function TopicSplitForm() {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
@@ -27,6 +31,11 @@ export default function TopicSplitForm() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isGeneratingMcqs, setIsGeneratingMcqs] = useState(false);
   const [mcqError, setMcqError] = useState<string | null>(null);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
+  const [jobLogs, setJobLogs] = useState<string[]>([]);
+
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fileLabel = useMemo(() => {
     if (!pdfFile) {
@@ -140,9 +149,17 @@ export default function TopicSplitForm() {
       return;
     }
 
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+
     setIsGeneratingMcqs(true);
     setMcqError(null);
-    setMcqStatus("Generating MCQ sets for each topic…");
+    setMcqStatus("Queued MCQ generation job…");
+    setJobId(null);
+    setJobStatus(null);
+    setJobLogs([]);
 
     try {
       const response = await fetch("/api/mcqs", {
@@ -159,29 +176,99 @@ export default function TopicSplitForm() {
         }),
       });
 
-      if (!response.ok) {
-        const problem = await response.json().catch(() => null);
-        throw new Error(problem?.error ?? "Failed to generate MCQs.");
+      const payload = await response.json().catch(() => ({} as { jobId?: string; error?: string }));
+
+      if (!response.ok || !payload?.jobId) {
+        throw new Error(payload?.error ?? "Failed to queue MCQ generation.");
       }
 
-      const blob = await response.blob();
-      const downloadUrl = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = downloadUrl;
-      anchor.download = `chapter-${chapterNumber}-mcqs.csv`;
-      document.body.append(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(downloadUrl);
+      setJobId(payload.jobId);
+      setJobStatus("pending");
+      setMcqStatus("MCQ job queued. Validation in progress…");
 
-      setMcqStatus("All MCQ sets generated and download started.");
+      const poll = async () => {
+        try {
+          const statusResponse = await fetch(`/api/mcqs/status?jobId=${payload.jobId}`);
+          const statusPayload = await statusResponse.json().catch(() => null);
+
+          if (!statusResponse.ok || !statusPayload) {
+            throw new Error(statusPayload?.error ?? "Unable to poll MCQ job status.");
+          }
+
+          setJobStatus(statusPayload.status as JobStatus);
+          setJobLogs(Array.isArray(statusPayload.logs) ? statusPayload.logs : []);
+
+          if (statusPayload.status === "succeeded") {
+            setMcqStatus("Validation succeeded. Preparing download…");
+            if (pollIntervalRef.current) {
+              clearInterval(pollIntervalRef.current);
+              pollIntervalRef.current = null;
+            }
+
+            const resultResponse = await fetch(`/api/mcqs/result?jobId=${payload.jobId}`);
+
+            if (!resultResponse.ok) {
+              const problem = await resultResponse
+                .json()
+                .catch(() => null);
+              throw new Error(problem?.error ?? "Unable to retrieve MCQ results.");
+            }
+
+            const blob = await resultResponse.blob();
+            const downloadUrl = URL.createObjectURL(blob);
+            const anchor = document.createElement("a");
+            anchor.href = downloadUrl;
+            anchor.download = `chapter-${chapterNumber}-mcqs.csv`;
+            document.body.append(anchor);
+            anchor.click();
+            anchor.remove();
+            URL.revokeObjectURL(downloadUrl);
+
+            setMcqStatus("All MCQ sets generated and download started.");
+            setIsGeneratingMcqs(false);
+          } else if (statusPayload.status === "failed") {
+            if (pollIntervalRef.current) {
+              clearInterval(pollIntervalRef.current);
+              pollIntervalRef.current = null;
+            }
+            setMcqError(statusPayload.error ?? "MCQ generation failed.");
+            setMcqStatus(null);
+            setIsGeneratingMcqs(false);
+          } else {
+            setMcqStatus(
+              statusPayload.status === "processing"
+                ? "Validation in progress…"
+                : "Job queued…",
+            );
+          }
+        } catch (error) {
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+          }
+          setMcqError(error instanceof Error ? error.message : "Unable to poll MCQ job.");
+          setMcqStatus(null);
+          setIsGeneratingMcqs(false);
+        }
+      };
+
+      await poll();
+      pollIntervalRef.current = setInterval(poll, 2000);
     } catch (cause) {
       setMcqError(cause instanceof Error ? cause.message : "Unexpected error while creating MCQs.");
       setMcqStatus(null);
-    } finally {
       setIsGeneratingMcqs(false);
     }
   }, [bookFingerprint, chapterNumber, chapterTitle, topics, vectorStoreId]);
+
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+    };
+  }, []);
 
   return (
     <form className="form" onSubmit={handleSubmit}>
@@ -245,6 +332,18 @@ export default function TopicSplitForm() {
           </button>
           {mcqStatus && !mcqError && <span className="status">{mcqStatus}</span>}
           {mcqError && <span className="status error">{mcqError}</span>}
+        </div>
+      )}
+
+      {jobStatus && (
+        <div className="status" aria-live="polite">
+          Job status: {jobStatus}
+          {jobLogs.length > 0 && (
+            <>
+              <br />
+              Last update: {jobLogs[jobLogs.length - 1]}
+            </>
+          )}
         </div>
       )}
 

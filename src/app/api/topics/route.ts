@@ -60,10 +60,13 @@ export async function POST(request: NextRequest) {
         ? ((pdf as { name: string }).name || "book.pdf")
         : "book.pdf";
 
+    const forwardedFor = request.headers.get("x-forwarded-for");
+    const requesterAddress = forwardedFor?.split(",")[0]?.trim();
+
     const cacheKey =
       typeof bookIdentifier === "string" && bookIdentifier.trim().length > 0
         ? bookIdentifier.trim()
-        : request.ip ?? `${filename}:${pdf.size}`;
+        : requesterAddress ?? `${filename}:${pdf.size}`;
 
     if (cacheKey) {
       for (const [key, entry] of storeCache.entries()) {
@@ -82,8 +85,9 @@ export async function POST(request: NextRequest) {
     }
 
     if (!vectorStoreId) {
+      const webStream = pdf.stream();
       const uploadable = await toFile(
-        Readable.fromWeb(pdf.stream() as unknown as ReadableStream<Uint8Array>),
+        Readable.fromWeb(webStream as unknown as globalThis.ReadableStream<Uint8Array> as any),
         filename,
         {
           type:
@@ -109,7 +113,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const systemMessage = `You are an expert curriculum designer. Focus strictly on Chapter ${chapterNumber} titled "${chapterTitle}" within the provided book PDF. Extract between six and ten concise topic areas that best summarize the requested chapter. Each topic must include a short, reader-friendly description. Ignore other chapters even if present.`;
+    const systemMessage = `You are an expert curriculum designer. Focus strictly on Chapter ${chapterNumber} titled "${chapterTitle}" within the provided book PDF. Extract between three and eight concise topic areas that best summarize the requested chapter. Each topic must include a short, reader-friendly description. Ignore other chapters even if present.`;
 
     const response = await openai.responses.create({
       model: MODEL,
@@ -120,7 +124,7 @@ export async function POST(request: NextRequest) {
           content: [
             {
               type: "input_text",
-              text: `Using the indexed book, list 6-10 well-defined topics for Chapter ${chapterNumber} titled "${chapterTitle}". Provide a short learner-friendly description for each topic and omit other chapters.`,
+              text: `Using the indexed book, list 3-8 well-defined topics for Chapter ${chapterNumber} titled "${chapterTitle}". Provide a short learner-friendly description for each topic and omit other chapters.`,
             },
           ],
         },
@@ -143,8 +147,8 @@ export async function POST(request: NextRequest) {
             properties: {
               topics: {
                 type: "array",
-                minItems: 6,
-                maxItems: 10,
+                minItems: 3,
+                maxItems: 8,
                 items: {
                   type: "object",
                   additionalProperties: false,
@@ -172,6 +176,7 @@ export async function POST(request: NextRequest) {
     try {
       parsed = JSON.parse(output);
     } catch (error) {
+      console.error("[topics] Failed to parse topics JSON", error, "output:", output);
       throw new Error("Failed to parse model output as JSON.");
     }
 
