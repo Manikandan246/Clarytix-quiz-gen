@@ -21,12 +21,15 @@ This package hosts a prototype service for topic generation from book chapters u
 - The API request uses the Responses API with a `json_schema` response format to guarantee structured output.
 - Uploads are cached in-memory for one hour to avoid repeatedly re-ingesting the same book during a session.
 - File-search keeps Responses well below token-per-minute limits by letting the model retrieve only the relevant chapter excerpts.
-- The frontend surfaces request states (idle, loading, error) and renders the topic list.
-- MCQ generation now queues an asynchronous job (`POST /api/mcqs`), producing a dedicated question set (10–15 MCQs per topic) and storing the CSV server-side until validation finishes.
-- The UI polls `/api/mcqs/status?jobId=…` and downloads the CSV from `/api/mcqs/result?jobId=…` when Claude approval completes.
+- The frontend now requires a class (5–12) and loads subjects from Postgres (`GET /api/subjects?class=…`) before generating topics/MCQs.
+- MCQ generation queues an asynchronous job (`POST /api/mcqs`), producing a dedicated question set (10–15 MCQs per topic) and storing the CSV server-side until validation finishes.
+- After a job completes, the service upserts the chapter/topics/questions into Postgres (`chapters`, `topics`, `questions`) keyed by class and subject.
+- The UI polls `/api/mcqs/status?jobId=…` and downloads the CSV from `/api/mcqs/result?jobId=…` when Claude approval completes. Token usage totals for OpenAI and Anthropic are exposed via the status endpoint for auditing.
 - A validator endpoint integrates with Claude; MCQs are cross-checked per topic in batches. Rejected questions are automatically rewritten by the validator before CSV export, and server logs capture each replacement for troubleshooting.
 - Environment variable: `OPENAI_API_KEY` must be configured before running the app.
 - Environment variable: `ANTHROPIC_API_KEY` must be configured to enable MCQ validation.
+- Environment variable: `DATABASE_URL` must point to the Postgres instance that hosts the `subjects` table.
+  - The `subjects` table should expose `id`, `class` (integer), and either `subject_name` or `name`; results are ordered alphabetically per class.
 
 ## Next Steps
 

@@ -4,6 +4,7 @@ import {
   type McqValidatorSummary,
   type TopicValidationPayload,
   type ReplacementMcq,
+  type ValidationRunResult,
 } from "@/lib/anthropic";
 import { getOpenAIClient } from "@/lib/openai";
 import {
@@ -13,6 +14,7 @@ import {
   type TopicSummary,
   getJobStore,
 } from "./jobStore";
+import { getDbPool } from "@/lib/db";
 
 const MODEL = "gpt-4.1";
 const MAX_VALIDATION_ATTEMPTS = 2;
@@ -345,6 +347,108 @@ function cloneMcqItem(item: McqItem): McqItem {
   };
 }
 
+async function persistChapterToDatabase(options: {
+  classLevel: number;
+  subjectId: number;
+  chapterNumber: number;
+  chapterTitle: string;
+  topics: Array<{ name: string; items: McqItem[] }>;
+  log: (...args: unknown[]) => void;
+}) {
+  const { classLevel, subjectId, chapterNumber, chapterTitle, topics, log } = options;
+  const pool = getDbPool();
+  const client = await pool.connect();
+  const classLabel = `Class ${classLevel}`;
+  const chapterName = `Chapter ${chapterNumber}: ${chapterTitle}`.trim();
+
+  try {
+    await client.query("BEGIN");
+
+    let chapterId: number;
+    const existingChapter = await client.query<{ id: number }>(
+      `SELECT id FROM chapters WHERE subject_id = $1 AND class = $2 AND chapter_name = $3`,
+      [subjectId, classLabel, chapterName],
+    );
+
+    if (existingChapter.rowCount && existingChapter.rows[0]) {
+      chapterId = existingChapter.rows[0].id;
+      log(`Using existing chapter #${chapterId} for ${classLabel} – ${chapterName}.`);
+    } else {
+      const insertedChapter = await client.query<{ id: number }>(
+        `INSERT INTO chapters (subject_id, class, chapter_name)
+         VALUES ($1, $2, $3)
+         RETURNING id`,
+        [subjectId, classLabel, chapterName],
+      );
+      chapterId = insertedChapter.rows[0].id;
+      log(`Inserted chapter #${chapterId} for ${classLabel} – ${chapterName}.`);
+    }
+
+    for (const topic of topics) {
+      const topicResult = await client.query<{ id: number }>(
+        `INSERT INTO topics (subject_id, name, class, chapter_id)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (subject_id, name, class)
+         DO UPDATE SET chapter_id = EXCLUDED.chapter_id
+         RETURNING id`,
+        [subjectId, topic.name, classLabel, chapterId],
+      );
+
+      const topicId = topicResult.rows[0].id;
+      log(`Upserted topic "${topic.name}" with id ${topicId}.`);
+
+      await client.query(`DELETE FROM questions WHERE topic_id = $1 AND class = $2`, [
+        topicId,
+        classLabel,
+      ]);
+
+      for (const item of topic.items) {
+        const optionsPadded = [...item.options];
+        while (optionsPadded.length < 4) {
+          optionsPadded.push("");
+        }
+
+        const correctLetter = LETTERS[item.correct_index] ?? LETTERS[0];
+
+        await client.query(
+          `INSERT INTO questions (
+             topic_id,
+             class,
+             question_text,
+             option_a,
+             option_b,
+             option_c,
+             option_d,
+             correct_answer,
+             explanation,
+             image_url
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [
+            topicId,
+            classLabel,
+            item.stem,
+            optionsPadded[0],
+            optionsPadded[1],
+            optionsPadded[2],
+            optionsPadded[3],
+            correctLetter,
+            item.explanation ?? "",
+            null,
+          ],
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+    log("Chapter, topics, and questions stored in the database.");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 function normalizeReplacementMcq(replacement: ReplacementMcq, fallback: McqItem): McqItem {
   const options = Array.isArray(replacement.options)
     ? [...replacement.options]
@@ -490,7 +594,20 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
   log("Processing started.");
 
   try {
-    const { chapterNumber, chapterTitle, topics, vectorStoreId } = record.payload;
+    const {
+      chapterNumber,
+      chapterTitle,
+      topics,
+      vectorStoreId,
+      classLevel,
+      subject,
+    } = record.payload;
+
+    if (!subject || typeof subject.id !== "number") {
+      throw new Error("Subject information missing in job payload.");
+    }
+
+    log(`Starting job for Class ${classLevel}, Subject ${subject.name}.`);
 
     const openai = getOpenAIClient();
     if (!openai) {
@@ -652,6 +769,27 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
       });
     });
 
+    try {
+      await persistChapterToDatabase({
+        classLevel,
+        subjectId: subject.id,
+        chapterNumber,
+        chapterTitle,
+        topics: successfulTopics.map((topic) => ({
+          name: topic.topic,
+          items: topic.items,
+        })),
+        log,
+      });
+    } catch (persistError) {
+      console.error(`[job ${jobId}] Database persistence failed`, persistError);
+      record.status = "failed";
+      record.error = "Failed to persist MCQs to the database.";
+      record.updatedAt = Date.now();
+      log("Database persistence failed:", persistError instanceof Error ? persistError.message : persistError);
+      return;
+    }
+
     const csv = `\ufeff${toCsv(rows)}`;
 
     record.resultCsv = csv;
@@ -722,12 +860,16 @@ export async function POST(request: NextRequest) {
       topics,
       vectorStoreId,
       bookFingerprint = null,
+      classLevel,
+      subject,
     }: {
       chapterNumber: number;
       chapterTitle: string;
       topics: TopicSummary[];
       vectorStoreId: string;
       bookFingerprint?: string | null;
+      classLevel: number;
+      subject: { id?: number | null; name?: string };
     } = body ?? {};
 
     if (!Array.isArray(topics) || topics.length === 0) {
@@ -746,12 +888,30 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Chapter title is required." }, { status: 400 });
     }
 
+    if (typeof classLevel !== "number" || Number.isNaN(classLevel)) {
+      return NextResponse.json({ error: "Class level is required." }, { status: 400 });
+    }
+
+    if (
+      !subject ||
+      typeof subject.name !== "string" ||
+      subject.name.trim().length === 0 ||
+      typeof subject.id !== "number"
+    ) {
+      return NextResponse.json({ error: "Subject is required." }, { status: 400 });
+    }
+
     const payload: JobPayload = {
       chapterNumber,
       chapterTitle,
       topics,
       vectorStoreId,
       bookFingerprint,
+      classLevel,
+      subject: {
+        id: subject.id,
+        name: subject.name.trim(),
+      },
     };
 
     const record = createJob(payload);

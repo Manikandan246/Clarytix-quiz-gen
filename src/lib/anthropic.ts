@@ -54,6 +54,11 @@ export interface TopicValidationVerdict {
 export interface TopicValidationResponse {
   topic: string;
   verdicts: TopicValidationVerdict[];
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  };
 }
 
 export interface McqValidatorSummary {

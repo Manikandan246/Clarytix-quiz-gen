@@ -12,10 +12,12 @@
     "jsonrepair": "^3.6.1",
     "next": "15.5.4",
     "openai": "^4.85.1",
+    "pg": "^8.11.3",
     "react": "19.1.0",
     "react-dom": "19.1.0"
   },
   "devDependencies": {
+    "@types/pg": "^8.11.6",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

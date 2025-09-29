@@ -11,6 +11,11 @@ export interface JobPayload {
   topics: TopicSummary[];
   vectorStoreId: string;
   bookFingerprint?: string | null;
+  classLevel: number;
+  subject: {
+    id: number;
+    name: string;
+  };
 }
 
 export type JobStatus = "pending" | "processing" | "succeeded" | "failed";
