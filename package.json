@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "eslint ."
   },
   "dependencies": {
     "jsonrepair": "^3.6.1",
@@ -17,8 +17,9 @@
     "react-dom": "19.1.0"
   },
   "devDependencies": {
-    "@types/pg": "^8.11.6",
+    "@eslint/eslintrc": "^3.3.1",
     "@types/node": "^20",
+    "@types/pg": "^8.11.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",

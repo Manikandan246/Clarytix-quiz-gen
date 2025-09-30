@@ -86,8 +86,11 @@ export async function POST(request: NextRequest) {
 
     if (!vectorStoreId) {
       const webStream = pdf.stream();
+      const readableStream = Readable.fromWeb(
+        webStream as unknown as globalThis.ReadableStream<Uint8Array>,
+      );
       const uploadable = await toFile(
-        Readable.fromWeb(webStream as unknown as globalThis.ReadableStream<Uint8Array> as any),
+        readableStream,
         filename,
         {
           type:

@@ -4,13 +4,11 @@ import {
   type McqValidatorSummary,
   type TopicValidationPayload,
   type ReplacementMcq,
-  type ValidationRunResult,
 } from "@/lib/anthropic";
 import { getOpenAIClient } from "@/lib/openai";
 import {
   type JobPayload,
   type JobRecord,
-  type JobStatus,
   type TopicSummary,
   getJobStore,
 } from "./jobStore";
@@ -571,7 +569,7 @@ async function generateMcqsForTopic(options: {
 
   try {
     parsed = JSON.parse(output);
-  } catch (error) {
+  } catch {
     throw new Error(`Failed to parse MCQ JSON response for topic "${topic.topic}".`);
   }
 
@@ -669,7 +667,7 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
       generatedTopics.push({ topic: topic.topic, items: mcqs.map((item) => cloneMcqItem(item)) });
     }
 
-    let currentTopics = generatedTopics.map((topic) => ({
+    const currentTopics = generatedTopics.map((topic) => ({
       topic: topic.topic,
       items: topic.items.map((item) => cloneMcqItem(item)),
     }));

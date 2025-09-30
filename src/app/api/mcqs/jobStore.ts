@@ -48,7 +48,6 @@ export interface JobRecord {
 export type JobStore = Map<string, JobRecord>;
 
 declare global {
-  // eslint-disable-next-line no-var
   var __mcqJobStore: JobStore | undefined;
 }
 

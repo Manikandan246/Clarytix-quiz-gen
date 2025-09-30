@@ -65,7 +65,6 @@ export default function TopicSplitForm() {
   const [syllabusesLoading, setSyllabusesLoading] = useState(false);
   const [syllabusesError, setSyllabusesError] = useState<string | null>(null);
   const [selectedSyllabus, setSelectedSyllabus] = useState<SyllabusOption | null>(null);
-  const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
   const [jobLogs, setJobLogs] = useState<string[]>([]);
   const [openAiUsage, setOpenAiUsage] = useState<TokenUsageTotals | null>(null);
@@ -338,7 +337,6 @@ export default function TopicSplitForm() {
     setIsGeneratingMcqs(true);
     setMcqError(null);
     setMcqStatus(`Queued MCQ generation job for Class ${selectedClass} – ${selectedSubject.name}…`);
-    setJobId(null);
     setJobStatus(null);
       setJobLogs([]);
       setOpenAiUsage(null);
@@ -376,7 +374,6 @@ export default function TopicSplitForm() {
         throw new Error(payload?.error ?? "Failed to queue MCQ generation.");
       }
 
-      setJobId(payload.jobId);
       setJobStatus("pending");
 
       const poll = async () => {

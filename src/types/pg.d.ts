@@ -1,11 +1,11 @@
 declare module "pg" {
-  interface QueryResult<T = any> {
+  interface QueryResult<T = unknown> {
     rows: T[];
     rowCount?: number;
   }
 
   interface PoolClient {
-    query<T = any>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
+    query<T = unknown>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
     release(): void;
   }
 
@@ -16,7 +16,7 @@ declare module "pg" {
 
   export class Pool {
     constructor(config: PoolConfig);
-    query<T = any>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
+    query<T = unknown>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
     connect(): Promise<PoolClient>;
   }
 }
