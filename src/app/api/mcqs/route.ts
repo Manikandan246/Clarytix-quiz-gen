@@ -358,21 +358,41 @@ async function persistChapterToDatabase(options: {
   const pool = getDbPool();
   const client = await pool.connect();
   const classLabel = `Class ${classLevel}`;
-  const chapterName = `Chapter ${chapterNumber}: ${chapterTitle}`.trim();
+  const normalizedChapterTitle = chapterTitle.trim();
+  const chapterLogLabel = `Chapter ${chapterNumber}: ${normalizedChapterTitle}`.trim();
   const normalizedSyllabus = syllabusName.trim();
 
   try {
     await client.query("BEGIN");
 
     let chapterId: number;
-    const existingChapter = await client.query<{ id: number; syllabus: string | null }>(
+    let existingChapter = await client.query<{ id: number; syllabus: string | null }>(
       `SELECT id, syllabus FROM chapters WHERE subject_id = $1 AND class = $2 AND chapter_name = $3`,
-      [subjectId, classLabel, chapterName],
+      [subjectId, classLabel, normalizedChapterTitle],
     );
+
+    if (!existingChapter.rowCount) {
+      const legacyChapter = await client.query<{ id: number; syllabus: string | null }>(
+        `SELECT id, syllabus FROM chapters WHERE subject_id = $1 AND class = $2 AND chapter_name = $3`,
+        [subjectId, classLabel, chapterLogLabel],
+      );
+
+      if (legacyChapter.rowCount && legacyChapter.rows[0]) {
+        const legacyId = legacyChapter.rows[0].id;
+        await client.query(`UPDATE chapters SET chapter_name = $1 WHERE id = $2`, [
+          normalizedChapterTitle,
+          legacyId,
+        ]);
+        existingChapter = legacyChapter;
+        log(
+          `Migrated chapter #${legacyId} for ${classLabel} to use plain title "${normalizedChapterTitle}".`,
+        );
+      }
+    }
 
     if (existingChapter.rowCount && existingChapter.rows[0]) {
       chapterId = existingChapter.rows[0].id;
-      log(`Using existing chapter #${chapterId} for ${classLabel} – ${chapterName}.`);
+      log(`Using existing chapter #${chapterId} for ${classLabel} – ${chapterLogLabel}.`);
       if ((existingChapter.rows[0].syllabus ?? "").trim() !== normalizedSyllabus) {
         await client.query(`UPDATE chapters SET syllabus = $1 WHERE id = $2`, [
           normalizedSyllabus,
@@ -385,10 +405,10 @@ async function persistChapterToDatabase(options: {
         `INSERT INTO chapters (subject_id, class, chapter_name, syllabus)
          VALUES ($1, $2, $3, $4)
          RETURNING id`,
-        [subjectId, classLabel, chapterName, normalizedSyllabus],
+        [subjectId, classLabel, normalizedChapterTitle, normalizedSyllabus],
       );
       chapterId = insertedChapter.rows[0].id;
-      log(`Inserted chapter #${chapterId} for ${classLabel} – ${chapterName}.`);
+      log(`Inserted chapter #${chapterId} for ${classLabel} – ${chapterLogLabel}.`);
     }
 
     for (const topic of topics) {
