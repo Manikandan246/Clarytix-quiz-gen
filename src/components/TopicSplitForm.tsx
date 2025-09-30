@@ -581,7 +581,6 @@ export default function TopicSplitForm() {
           id="chapterNumber"
           type="text"
           inputMode="numeric"
-          pattern="\\d*"
           placeholder="e.g. 1"
           value={chapterNumber}
           onChange={(event) => {
