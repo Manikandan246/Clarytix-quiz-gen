@@ -255,19 +255,9 @@ export default function TopicSplitForm() {
   }, [selectedClass]);
 
   useEffect(() => {
-    if (selectedClass === null) {
-      setAvailableSyllabuses([]);
-      setSelectedSyllabus(null);
-      setSyllabusesError(null);
-      setSyllabusesLoading(false);
-      return;
-    }
-
     let cancelled = false;
     setSyllabusesLoading(true);
     setSyllabusesError(null);
-    setAvailableSyllabuses([]);
-    setSelectedSyllabus(null);
 
     fetch("/api/syllabus")
       .then(async (response) => {
@@ -305,7 +295,7 @@ export default function TopicSplitForm() {
     return () => {
       cancelled = true;
     };
-  }, [selectedClass]);
+  }, []);
 
   const handleDownloadMcqs = useCallback(async () => {
     if (!topics || topics.length === 0) {
@@ -480,9 +470,6 @@ export default function TopicSplitForm() {
                 setSelectedClass(level);
                 setError(null);
                 setMcqError(null);
-                setSelectedSyllabus(null);
-                setAvailableSyllabuses([]);
-                setSyllabusesError(null);
               }}
               disabled={isSubmitting}
             >
@@ -492,42 +479,40 @@ export default function TopicSplitForm() {
         </div>
       </fieldset>
 
-      {selectedClass !== null && (
-        <fieldset>
-          <label>Syllabus</label>
-          {syllabusesLoading && <span className="status">Loading syllabuses…</span>}
-          {syllabusesError && <span className="status error">{syllabusesError}</span>}
-          {!syllabusesLoading && !syllabusesError && availableSyllabuses.length === 0 && (
-            <span className="status">No syllabuses found.</span>
-          )}
-          {availableSyllabuses.length > 0 && (
-            <select
-              value={selectedSyllabus?.id ?? ""}
-              onChange={(event) => {
-                const option = availableSyllabuses.find(
-                  (entry) => entry.id === Number.parseInt(event.target.value, 10),
-                );
-                if (option) {
-                  setSelectedSyllabus(option);
-                  setError(null);
-                  setMcqError(null);
-                }
-              }}
-              disabled={isSubmitting}
-              className="select-compact"
-            >
-              <option value="" disabled>
-                Select a syllabus
+      <fieldset>
+        <label>Syllabus</label>
+        {syllabusesLoading && <span className="status">Loading syllabuses…</span>}
+        {syllabusesError && <span className="status error">{syllabusesError}</span>}
+        {!syllabusesLoading && !syllabusesError && availableSyllabuses.length === 0 && (
+          <span className="status">No syllabuses found.</span>
+        )}
+        {availableSyllabuses.length > 0 && (
+          <select
+            value={selectedSyllabus?.id ?? ""}
+            onChange={(event) => {
+              const option = availableSyllabuses.find(
+                (entry) => entry.id === Number.parseInt(event.target.value, 10),
+              );
+              if (option) {
+                setSelectedSyllabus(option);
+                setError(null);
+                setMcqError(null);
+              }
+            }}
+            disabled={isSubmitting}
+            className="select-compact"
+          >
+            <option value="" disabled>
+              Select a syllabus
+            </option>
+            {availableSyllabuses.map((syllabus) => (
+              <option key={syllabus.id} value={syllabus.id}>
+                {syllabus.name}
               </option>
-              {availableSyllabuses.map((syllabus) => (
-                <option key={syllabus.id} value={syllabus.id}>
-                  {syllabus.name}
-                </option>
-              ))}
-            </select>
-          )}
-        </fieldset>
-      )}
+            ))}
+          </select>
+        )}
+      </fieldset>
 
       <fieldset>
         <label>Subject</label>
