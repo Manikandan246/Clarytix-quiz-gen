@@ -352,33 +352,42 @@ async function persistChapterToDatabase(options: {
   subjectId: number;
   chapterNumber: number;
   chapterTitle: string;
+  syllabusName: string;
   topics: Array<{ name: string; items: McqItem[] }>;
   log: (...args: unknown[]) => void;
 }) {
-  const { classLevel, subjectId, chapterNumber, chapterTitle, topics, log } = options;
+  const { classLevel, subjectId, chapterNumber, chapterTitle, syllabusName, topics, log } = options;
   const pool = getDbPool();
   const client = await pool.connect();
   const classLabel = `Class ${classLevel}`;
   const chapterName = `Chapter ${chapterNumber}: ${chapterTitle}`.trim();
+  const normalizedSyllabus = syllabusName.trim();
 
   try {
     await client.query("BEGIN");
 
     let chapterId: number;
-    const existingChapter = await client.query<{ id: number }>(
-      `SELECT id FROM chapters WHERE subject_id = $1 AND class = $2 AND chapter_name = $3`,
+    const existingChapter = await client.query<{ id: number; syllabus: string | null }>(
+      `SELECT id, syllabus FROM chapters WHERE subject_id = $1 AND class = $2 AND chapter_name = $3`,
       [subjectId, classLabel, chapterName],
     );
 
     if (existingChapter.rowCount && existingChapter.rows[0]) {
       chapterId = existingChapter.rows[0].id;
       log(`Using existing chapter #${chapterId} for ${classLabel} – ${chapterName}.`);
+      if ((existingChapter.rows[0].syllabus ?? "").trim() !== normalizedSyllabus) {
+        await client.query(`UPDATE chapters SET syllabus = $1 WHERE id = $2`, [
+          normalizedSyllabus,
+          chapterId,
+        ]);
+        log(`Updated syllabus for chapter #${chapterId} to ${normalizedSyllabus}.`);
+      }
     } else {
       const insertedChapter = await client.query<{ id: number }>(
-        `INSERT INTO chapters (subject_id, class, chapter_name)
-         VALUES ($1, $2, $3)
+        `INSERT INTO chapters (subject_id, class, chapter_name, syllabus)
+         VALUES ($1, $2, $3, $4)
          RETURNING id`,
-        [subjectId, classLabel, chapterName],
+        [subjectId, classLabel, chapterName, normalizedSyllabus],
       );
       chapterId = insertedChapter.rows[0].id;
       log(`Inserted chapter #${chapterId} for ${classLabel} – ${chapterName}.`);
@@ -601,13 +610,20 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
       vectorStoreId,
       classLevel,
       subject,
+      syllabus,
     } = record.payload;
 
     if (!subject || typeof subject.id !== "number") {
       throw new Error("Subject information missing in job payload.");
     }
 
-    log(`Starting job for Class ${classLevel}, Subject ${subject.name}.`);
+    if (!syllabus || typeof syllabus.name !== "string") {
+      throw new Error("Syllabus information missing in job payload.");
+    }
+
+    log(
+      `Starting job for Class ${classLevel}, Subject ${subject.name}, Syllabus ${syllabus.name}.`,
+    );
 
     const openai = getOpenAIClient();
     if (!openai) {
@@ -775,6 +791,7 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
         subjectId: subject.id,
         chapterNumber,
         chapterTitle,
+        syllabusName: syllabus.name,
         topics: successfulTopics.map((topic) => ({
           name: topic.topic,
           items: topic.items,
@@ -862,6 +879,7 @@ export async function POST(request: NextRequest) {
       bookFingerprint = null,
       classLevel,
       subject,
+      syllabus,
     }: {
       chapterNumber: number;
       chapterTitle: string;
@@ -870,6 +888,7 @@ export async function POST(request: NextRequest) {
       bookFingerprint?: string | null;
       classLevel: number;
       subject: { id?: number | null; name?: string };
+      syllabus: { id?: number | null; name?: string };
     } = body ?? {};
 
     if (!Array.isArray(topics) || topics.length === 0) {
@@ -901,6 +920,15 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Subject is required." }, { status: 400 });
     }
 
+    if (
+      !syllabus ||
+      typeof syllabus.name !== "string" ||
+      syllabus.name.trim().length === 0 ||
+      typeof syllabus.id !== "number"
+    ) {
+      return NextResponse.json({ error: "Syllabus is required." }, { status: 400 });
+    }
+
     const payload: JobPayload = {
       chapterNumber,
       chapterTitle,
@@ -911,6 +939,10 @@ export async function POST(request: NextRequest) {
       subject: {
         id: subject.id,
         name: subject.name.trim(),
+      },
+      syllabus: {
+        id: syllabus.id,
+        name: syllabus.name.trim(),
       },
     };
 

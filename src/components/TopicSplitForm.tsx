@@ -20,6 +20,11 @@ interface SubjectOption {
   name: string;
 }
 
+interface SyllabusOption {
+  id: number;
+  name: string;
+}
+
 interface TokenUsageTotals {
   inputTokens: number;
   outputTokens: number;
@@ -56,6 +61,10 @@ export default function TopicSplitForm() {
   const [subjectsLoading, setSubjectsLoading] = useState(false);
   const [subjectsError, setSubjectsError] = useState<string | null>(null);
   const [selectedSubject, setSelectedSubject] = useState<SubjectOption | null>(null);
+  const [availableSyllabuses, setAvailableSyllabuses] = useState<SyllabusOption[]>([]);
+  const [syllabusesLoading, setSyllabusesLoading] = useState(false);
+  const [syllabusesError, setSyllabusesError] = useState<string | null>(null);
+  const [selectedSyllabus, setSelectedSyllabus] = useState<SyllabusOption | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
   const [jobLogs, setJobLogs] = useState<string[]>([]);
@@ -136,6 +145,11 @@ export default function TopicSplitForm() {
         return;
       }
 
+      if (!selectedSyllabus) {
+        setError("Select a syllabus before generating topics.");
+        return;
+      }
+
       if (!chapterNumber.trim()) {
         setError("Enter a chapter number.");
         return;
@@ -159,6 +173,7 @@ export default function TopicSplitForm() {
       payload.append("chapterNumber", chapterNumber.trim());
       payload.append("chapterTitle", chapterTitle.trim());
       payload.append("classLevel", String(selectedClass));
+      payload.append("syllabusName", selectedSyllabus.name);
       if (bookFingerprint) {
         payload.append("bookFingerprint", bookFingerprint);
       }
@@ -185,7 +200,14 @@ export default function TopicSplitForm() {
         setIsSubmitting(false);
       }
     },
-    [bookFingerprint, chapterNumber, chapterTitle, pdfFile, selectedClass],
+    [
+      bookFingerprint,
+      chapterNumber,
+      chapterTitle,
+      pdfFile,
+      selectedClass,
+      selectedSyllabus,
+    ],
   );
 
   useEffect(() => {
@@ -233,6 +255,59 @@ export default function TopicSplitForm() {
     };
   }, [selectedClass]);
 
+  useEffect(() => {
+    if (selectedClass === null) {
+      setAvailableSyllabuses([]);
+      setSelectedSyllabus(null);
+      setSyllabusesError(null);
+      setSyllabusesLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setSyllabusesLoading(true);
+    setSyllabusesError(null);
+    setAvailableSyllabuses([]);
+    setSelectedSyllabus(null);
+
+    fetch("/api/syllabus")
+      .then(async (response) => {
+        if (!response.ok) {
+          const problem = await response.json().catch(() => null);
+          throw new Error(problem?.error ?? "Failed to fetch syllabuses.");
+        }
+        return response.json() as Promise<{ syllabuses?: SyllabusOption[] }>;
+      })
+      .then((data) => {
+        if (cancelled) {
+          return;
+        }
+        const syllabuses = Array.isArray(data.syllabuses) ? data.syllabuses : [];
+        setAvailableSyllabuses(syllabuses);
+        if (syllabuses.length === 1) {
+          setSelectedSyllabus(syllabuses[0]);
+        }
+      })
+      .catch((syllabusError) => {
+        if (cancelled) {
+          return;
+        }
+        console.error("[syllabus]", syllabusError);
+        setSyllabusesError(
+          syllabusError instanceof Error ? syllabusError.message : "Unable to load syllabuses.",
+        );
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setSyllabusesLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedClass]);
+
   const handleDownloadMcqs = useCallback(async () => {
     if (!topics || topics.length === 0) {
       setMcqError("Generate topics before requesting MCQs.");
@@ -251,6 +326,11 @@ export default function TopicSplitForm() {
 
     if (!selectedSubject) {
       setMcqError("Select a subject before generating MCQs.");
+      return;
+    }
+
+    if (!selectedSyllabus) {
+      setMcqError("Select a syllabus before generating MCQs.");
       return;
     }
 
@@ -280,6 +360,10 @@ export default function TopicSplitForm() {
           subject: {
             id: selectedSubject.id,
             name: selectedSubject.name,
+          },
+          syllabus: {
+            id: selectedSyllabus.id,
+            name: selectedSyllabus.name,
           },
         }),
       });
@@ -374,6 +458,7 @@ export default function TopicSplitForm() {
     resetJobPolling,
     selectedClass,
     selectedSubject,
+    selectedSyllabus,
     topics,
     vectorStoreId,
   ]);
@@ -398,6 +483,9 @@ export default function TopicSplitForm() {
                 setSelectedClass(level);
                 setError(null);
                 setMcqError(null);
+                setSelectedSyllabus(null);
+                setAvailableSyllabuses([]);
+                setSyllabusesError(null);
               }}
               disabled={isSubmitting}
             >
@@ -406,6 +494,43 @@ export default function TopicSplitForm() {
           ))}
         </div>
       </fieldset>
+
+      {selectedClass !== null && (
+        <fieldset>
+          <label>Syllabus</label>
+          {syllabusesLoading && <span className="status">Loading syllabuses…</span>}
+          {syllabusesError && <span className="status error">{syllabusesError}</span>}
+          {!syllabusesLoading && !syllabusesError && availableSyllabuses.length === 0 && (
+            <span className="status">No syllabuses found.</span>
+          )}
+          {availableSyllabuses.length > 0 && (
+            <select
+              value={selectedSyllabus?.id ?? ""}
+              onChange={(event) => {
+                const option = availableSyllabuses.find(
+                  (entry) => entry.id === Number.parseInt(event.target.value, 10),
+                );
+                if (option) {
+                  setSelectedSyllabus(option);
+                  setError(null);
+                  setMcqError(null);
+                }
+              }}
+              disabled={isSubmitting}
+              className="select-compact"
+            >
+              <option value="" disabled>
+                Select a syllabus
+              </option>
+              {availableSyllabuses.map((syllabus) => (
+                <option key={syllabus.id} value={syllabus.id}>
+                  {syllabus.name}
+                </option>
+              ))}
+            </select>
+          )}
+        </fieldset>
+      )}
 
       <fieldset>
         <label>Subject</label>

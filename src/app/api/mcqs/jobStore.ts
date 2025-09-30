@@ -16,6 +16,10 @@ export interface JobPayload {
     id: number;
     name: string;
   };
+  syllabus: {
+    id: number;
+    name: string;
+  };
 }
 
 export type JobStatus = "pending" | "processing" | "succeeded" | "failed";
