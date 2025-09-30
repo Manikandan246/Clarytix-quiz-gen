@@ -1,4 +1,5 @@
 import { Readable } from "node:stream";
+import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { type NextRequest, NextResponse } from "next/server";
 import { toFile } from "openai/uploads";
 import { getOpenAIClient } from "@/lib/openai";
@@ -87,7 +88,7 @@ export async function POST(request: NextRequest) {
     if (!vectorStoreId) {
       const webStream = pdf.stream();
       const readableStream = Readable.fromWeb(
-        webStream as unknown as globalThis.ReadableStream<Uint8Array>,
+        webStream as unknown as NodeReadableStream<Uint8Array>,
       );
       const uploadable = await toFile(
         readableStream,
