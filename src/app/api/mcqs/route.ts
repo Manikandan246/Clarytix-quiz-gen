@@ -10,6 +10,8 @@ import {
   type JobPayload,
   type JobRecord,
   type TopicSummary,
+  type StoredTopicMcqs,
+  type StoredMcqItem,
   getJobStore,
 } from "./jobStore";
 import { getDbPool } from "@/lib/db";
@@ -22,7 +24,7 @@ const MCQ_RUBRIC = `You are a K–12 curriculum expert and assessment designer.
 Goal: Generate high-quality MCQs strictly from the provided book PDF.
 
 Quantity per topic
-- Produce 10–15 MCQs (decide by topic size/complexity).
+- Produce either 10 or 15 MCQs. Choose 15 only when the retrieved context clearly supports a deeper, more complex treatment; otherwise stay at 10.
 - Keep questions varied and non-redundant.
 
 Diverse types (mix across the set)
@@ -71,17 +73,6 @@ Formatting & schema (JSON only)
     }
   ]
 }`;
-
-interface McqItem {
-  bloom: string;
-  difficulty: string;
-  stem: string;
-  options: string[];
-  correct_index: number;
-  explanation: string;
-  type: string;
-  source_spans?: Array<{ page: number | null; text_snippet: string }>;
-}
 
 const CSV_HEADERS = [
   "Topic",
@@ -241,7 +232,7 @@ function buildJsonSchema() {
   } as const;
 }
 
-function toCsv(table: Array<{ topic: string; item: McqItem }>): string {
+function toCsv(table: Array<{ topic: string; item: StoredMcqItem }>): string {
   const rows: string[][] = [CSV_HEADERS.slice()];
 
   for (const entry of table) {
@@ -293,9 +284,9 @@ function selectBalancedIndex(correctCounts: number[]): number {
 }
 
 function rebalanceCorrectOptions(
-  mcqs: McqItem[],
+  mcqs: StoredMcqItem[],
   correctCounts: number[],
-): McqItem[] {
+): StoredMcqItem[] {
   return mcqs.map((mcq) => {
     const options = Array.isArray(mcq.options) ? [...mcq.options] : [];
     while (options.length < 4) {
@@ -337,12 +328,201 @@ function rebalanceCorrectOptions(
 
 type OpenAIClient = NonNullable<ReturnType<typeof getOpenAIClient>>;
 
-function cloneMcqItem(item: McqItem): McqItem {
+function cloneMcqItem(item: StoredMcqItem): StoredMcqItem {
   return {
     ...item,
     options: [...item.options],
     source_spans: item.source_spans?.map((span) => ({ ...span })),
   };
+}
+
+async function validateAndFinalizeJob(options: {
+  jobId: string;
+  record: JobRecord;
+  generatedTopics: StoredTopicMcqs[];
+  classLevel: number;
+  subject: { id: number; name: string };
+  syllabus: { name: string };
+  chapterNumber: number;
+  chapterTitle: string;
+  log: (...args: unknown[]) => void;
+}): Promise<void> {
+  const {
+    jobId,
+    record,
+    generatedTopics,
+    classLevel,
+    subject,
+    syllabus,
+    chapterNumber,
+    chapterTitle,
+    log,
+  } = options;
+
+  const currentTopics = generatedTopics.map((topic) => ({
+    topic: topic.topic,
+    items: topic.items.map((item) => cloneMcqItem(item)),
+  }));
+
+  const failedTopicSummaries: McqValidatorSummary["topicSummaries"] = [];
+
+  for (let attempt = 1; attempt <= MAX_VALIDATION_ATTEMPTS; attempt += 1) {
+    const payload: TopicValidationPayload[] = currentTopics.map((currentTopic) => ({
+      topic: currentTopic.topic,
+      questions: currentTopic.items.map((item, index) => ({
+        index,
+        stem: item.stem,
+        options: item.options,
+        correctLetter: LETTERS[item.correct_index] ?? "A",
+        explanation: item.explanation,
+        sourceSnippet: item.source_spans?.[0]?.text_snippet ?? null,
+        bloom: item.bloom,
+        difficulty: item.difficulty,
+        type: item.type,
+      })),
+    }));
+
+    log(`Validation attempt ${attempt} started.`);
+    const { summary: validationSummary, usageTotals: anthUsage } = await retryWithBackoff(
+      () => validateTopics(payload),
+      {
+        label: `Anthropic validation attempt ${attempt}`,
+        log,
+        initialDelayMs: 5000,
+        maxAttempts: 6,
+      },
+    );
+
+    record.anthropicUsage.inputTokens += anthUsage.inputTokens;
+    record.anthropicUsage.outputTokens += anthUsage.outputTokens;
+    record.anthropicUsage.totalTokens += anthUsage.totalTokens;
+
+    log(
+      `Validation attempt ${attempt} token usage — input: ${anthUsage.inputTokens}, output: ${anthUsage.outputTokens}, total: ${anthUsage.totalTokens}.`,
+    );
+
+    const rejectedTopics = validationSummary.topicSummaries.filter((topicSummary) =>
+      topicSummary.verdicts.some((verdict) => verdict.verdict === "reject"),
+    );
+
+    if (rejectedTopics.length === 0) {
+      log(`Validation attempt ${attempt} succeeded.`);
+      record.summary = validationSummary;
+      failedTopicSummaries.length = 0;
+      break;
+    }
+
+    let replacedAny = false;
+
+    validationSummary.topicSummaries.forEach((topicSummary, topicIndex) => {
+      topicSummary.verdicts.forEach((verdict) => {
+        if (verdict.verdict === "reject") {
+          if (!verdict.replacementMcq) {
+            failedTopicSummaries.push(topicSummary);
+            return;
+          }
+
+          const bucket = currentTopics[topicIndex];
+          const fallback = bucket.items[verdict.index];
+          bucket.items[verdict.index] = normalizeReplacementMcq(
+            verdict.replacementMcq,
+            fallback,
+          );
+          replacedAny = true;
+          log(`Applied replacement for topic "${topicSummary.topic}" question ${verdict.index}.`);
+        }
+      });
+    });
+
+    if (!replacedAny) {
+      log("Validation failed without any provided replacements for at least one topic.");
+      failedTopicSummaries.push(...rejectedTopics);
+      break;
+    }
+  }
+
+  const successfulTopics = currentTopics.filter((topic) =>
+    !failedTopicSummaries.some((failed) => failed.topic === topic.topic),
+  );
+
+  if (successfulTopics.length === 0) {
+    record.status = "failed";
+    record.summary = {
+      overallStatus: "rejected",
+      topicSummaries: failedTopicSummaries,
+    };
+    record.error = "All topics failed validation.";
+    record.allowValidationRetry = false;
+    log(record.error);
+    return;
+  }
+
+  if (failedTopicSummaries.length > 0) {
+    log(`Validation completed with ${failedTopicSummaries.length} topic(s) requiring manual review.`);
+  }
+
+  const correctCounts = [0, 0, 0, 0];
+  const rows: Array<{ topic: string; item: StoredMcqItem }> = [];
+
+  successfulTopics.forEach((topicBucket) => {
+    const balanced = rebalanceCorrectOptions(topicBucket.items, correctCounts);
+    topicBucket.items = balanced;
+    balanced.forEach((item) => {
+      rows.push({ topic: topicBucket.topic, item });
+    });
+  });
+
+  try {
+    await persistChapterToDatabase({
+      classLevel,
+      subjectId: subject.id,
+      chapterNumber,
+      chapterTitle,
+      syllabusName: syllabus.name,
+      topics: successfulTopics.map((topic) => ({
+        name: topic.topic,
+        items: topic.items,
+      })),
+      log,
+    });
+  } catch (persistError) {
+    console.error(`[job ${jobId}] Database persistence failed`, persistError);
+    record.status = "failed";
+    record.error = "Failed to persist MCQs to the database.";
+    record.allowValidationRetry = false;
+    record.updatedAt = Date.now();
+    log(
+      "Database persistence failed:",
+      persistError instanceof Error ? persistError.message : persistError,
+    );
+    return;
+  }
+
+  const csv = `\ufeff${toCsv(rows)}`;
+
+  record.resultCsv = csv;
+  record.summary = {
+    overallStatus: failedTopicSummaries.length === 0 ? "approved" : "mixed",
+    topicSummaries: failedTopicSummaries.length === 0 ? [] : failedTopicSummaries,
+  };
+  record.outputFilename = `chapter-${record.payload.chapterNumber}-mcqs.csv`;
+  record.status = failedTopicSummaries.length === 0 ? "succeeded" : "succeeded";
+  record.error = failedTopicSummaries.length === 0
+    ? undefined
+    : "One or more topics require manual review.";
+  record.allowValidationRetry = false;
+  record.updatedAt = Date.now();
+  log(
+    `Total OpenAI tokens used: input ${record.openAiUsage.inputTokens}, output ${record.openAiUsage.outputTokens}, total ${record.openAiUsage.totalTokens}.`,
+  );
+  log(
+    `Total Anthropic tokens used: input ${record.anthropicUsage.inputTokens}, output ${record.anthropicUsage.outputTokens}, total ${record.anthropicUsage.totalTokens}.`,
+  );
+  log(
+    failedTopicSummaries.length === 0
+      ? "Job completed successfully."
+      : "Job completed partially; some topics need manual review.",
+  );
 }
 
 async function persistChapterToDatabase(options: {
@@ -351,7 +531,7 @@ async function persistChapterToDatabase(options: {
   chapterNumber: number;
   chapterTitle: string;
   syllabusName: string;
-  topics: Array<{ name: string; items: McqItem[] }>;
+  topics: Array<{ name: string; items: StoredMcqItem[] }>;
   log: (...args: unknown[]) => void;
 }) {
   const { classLevel, subjectId, chapterNumber, chapterTitle, syllabusName, topics, log } = options;
@@ -476,7 +656,10 @@ async function persistChapterToDatabase(options: {
   }
 }
 
-function normalizeReplacementMcq(replacement: ReplacementMcq, fallback: McqItem): McqItem {
+function normalizeReplacementMcq(
+  replacement: ReplacementMcq,
+  fallback: StoredMcqItem,
+): StoredMcqItem {
   const options = Array.isArray(replacement.options)
     ? [...replacement.options]
     : [...fallback.options];
@@ -542,7 +725,7 @@ async function generateMcqsForTopic(options: {
   vectorStoreId: string;
   topicIndex: number;
   totalTopics: number;
-}): Promise<{ mcqs: McqItem[]; usage?: OpenAiUsage }> {
+}): Promise<{ mcqs: StoredMcqItem[]; usage?: OpenAiUsage }> {
   const { openai, topic, chapterNumber, chapterTitle, vectorStoreId, topicIndex, totalTopics } = options;
 
   const instructions = buildInstructionPrompt(topic, chapterNumber, chapterTitle, topicIndex, totalTopics);
@@ -594,11 +777,17 @@ async function generateMcqsForTopic(options: {
   }
 
   const mcqs = Array.isArray((parsed as { mcqs?: unknown }).mcqs)
-    ? ((parsed as { mcqs: McqItem[] }).mcqs as McqItem[])
+    ? ((parsed as { mcqs: StoredMcqItem[] }).mcqs as StoredMcqItem[])
     : null;
 
   if (!mcqs || mcqs.length === 0) {
     throw new Error(`Model did not return any MCQs for topic "${topic.topic}".`);
+  }
+
+  if (mcqs.length !== 10 && mcqs.length !== 15) {
+    throw new Error(
+      `Model returned ${mcqs.length} MCQs for topic "${topic.topic}". Provide exactly 10 or 15 items based on topic complexity.`,
+    );
   }
 
   const usage = response.usage as OpenAiUsage | undefined;
@@ -648,7 +837,10 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
       throw new Error("OPENAI_API_KEY is not configured on the server.");
     }
 
-    const generatedTopics: Array<{ topic: string; items: McqItem[] }> = [];
+    record.generatedTopics = undefined;
+    record.allowValidationRetry = false;
+
+    const generatedTopics: StoredTopicMcqs[] = [];
 
     for (const [index, topic] of topics.entries()) {
       const { mcqs, usage } = await retryWithBackoff(
@@ -686,174 +878,39 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
 
       generatedTopics.push({ topic: topic.topic, items: mcqs.map((item) => cloneMcqItem(item)) });
     }
-
-    const currentTopics = generatedTopics.map((topic) => ({
+    record.generatedTopics = generatedTopics.map((topic) => ({
       topic: topic.topic,
       items: topic.items.map((item) => cloneMcqItem(item)),
     }));
+    record.allowValidationRetry = false;
 
-    const failedTopicSummaries: McqValidatorSummary["topicSummaries"] = [];
-
-    for (let attempt = 1; attempt <= MAX_VALIDATION_ATTEMPTS; attempt += 1) {
-      const payload: TopicValidationPayload[] = currentTopics.map((currentTopic) => ({
-        topic: currentTopic.topic,
-        questions: currentTopic.items.map((item, index) => ({
-          index,
-          stem: item.stem,
-          options: item.options,
-          correctLetter: LETTERS[item.correct_index] ?? "A",
-          explanation: item.explanation,
-          sourceSnippet: item.source_spans?.[0]?.text_snippet ?? null,
-          bloom: item.bloom,
-          difficulty: item.difficulty,
-          type: item.type,
-        })),
-      }));
-
-      log(`Validation attempt ${attempt} started.`);
-      const { summary: validationSummary, usageTotals: anthUsage } = await retryWithBackoff(
-        () => validateTopics(payload),
-        {
-          label: `Anthropic validation attempt ${attempt}`,
-          log,
-          initialDelayMs: 5000,
-          maxAttempts: 6,
-        },
-      );
-
-      record.anthropicUsage.inputTokens += anthUsage.inputTokens;
-      record.anthropicUsage.outputTokens += anthUsage.outputTokens;
-      record.anthropicUsage.totalTokens += anthUsage.totalTokens;
-
-      log(
-        `Validation attempt ${attempt} token usage — input: ${anthUsage.inputTokens}, output: ${anthUsage.outputTokens}, total: ${anthUsage.totalTokens}.`,
-      );
-
-      const rejectedTopics = validationSummary.topicSummaries.filter((topicSummary) =>
-        topicSummary.verdicts.some((verdict) => verdict.verdict === "reject"),
-      );
-
-      if (rejectedTopics.length === 0) {
-        log(`Validation attempt ${attempt} succeeded.`);
-        record.summary = validationSummary;
-        failedTopicSummaries.length = 0;
-        break;
-      }
-
-      let replacedAny = false;
-
-      validationSummary.topicSummaries.forEach((topicSummary, topicIndex) => {
-        topicSummary.verdicts.forEach((verdict) => {
-          if (verdict.verdict === "reject") {
-            if (!verdict.replacementMcq) {
-              failedTopicSummaries.push(topicSummary);
-              return;
-            }
-
-            const bucket = currentTopics[topicIndex];
-            const fallback = bucket.items[verdict.index];
-            bucket.items[verdict.index] = normalizeReplacementMcq(
-              verdict.replacementMcq,
-              fallback,
-            );
-            replacedAny = true;
-            log(
-              `Applied replacement for topic "${topicSummary.topic}" question ${verdict.index}.`,
-            );
-          }
-        });
-      });
-
-      if (!replacedAny) {
-        log("Validation failed without any provided replacements for at least one topic.");
-        failedTopicSummaries.push(...rejectedTopics);
-        break;
-      }
-    }
-
-    const successfulTopics = currentTopics.filter((topic) =>
-      !failedTopicSummaries.some((failed) => failed.topic === topic.topic),
-    );
-
-    if (successfulTopics.length === 0) {
-      record.status = "failed";
-      record.summary = {
-        overallStatus: "rejected",
-        topicSummaries: failedTopicSummaries,
-      };
-      record.error = "All topics failed validation.";
-      log(record.error);
-      return;
-    }
-
-    if (failedTopicSummaries.length > 0) {
-      log(
-        `Validation completed with ${failedTopicSummaries.length} topic(s) requiring manual review.`,
-      );
-    }
-
-    const correctCounts = [0, 0, 0, 0];
-    const rows: Array<{ topic: string; item: McqItem }> = [];
-
-    successfulTopics.forEach((topicBucket) => {
-      const balanced = rebalanceCorrectOptions(topicBucket.items, correctCounts);
-      topicBucket.items = balanced;
-      balanced.forEach((item) => {
-        rows.push({ topic: topicBucket.topic, item });
-      });
+    await validateAndFinalizeJob({
+      jobId,
+      record,
+      generatedTopics: record.generatedTopics.map((topic) => ({
+        topic: topic.topic,
+        items: topic.items.map((item) => cloneMcqItem(item)),
+      })),
+      classLevel,
+      subject,
+      syllabus,
+      chapterNumber,
+      chapterTitle,
+      log,
     });
 
-    try {
-      await persistChapterToDatabase({
-        classLevel,
-        subjectId: subject.id,
-        chapterNumber,
-        chapterTitle,
-        syllabusName: syllabus.name,
-        topics: successfulTopics.map((topic) => ({
-          name: topic.topic,
-          items: topic.items,
-        })),
-        log,
-      });
-    } catch (persistError) {
-      console.error(`[job ${jobId}] Database persistence failed`, persistError);
-      record.status = "failed";
-      record.error = "Failed to persist MCQs to the database.";
-      record.updatedAt = Date.now();
-      log("Database persistence failed:", persistError instanceof Error ? persistError.message : persistError);
-      return;
-    }
-
-    const csv = `\ufeff${toCsv(rows)}`;
-
-    record.resultCsv = csv;
-    record.summary = {
-      overallStatus: failedTopicSummaries.length === 0 ? "approved" : "mixed",
-      topicSummaries: failedTopicSummaries.length === 0 ? [] : failedTopicSummaries,
-    };
-    record.outputFilename = `chapter-${record.payload.chapterNumber}-mcqs.csv`;
-    record.status = failedTopicSummaries.length === 0 ? "succeeded" : "succeeded";
-    record.error = failedTopicSummaries.length === 0
-      ? undefined
-      : "One or more topics require manual review.";
-    record.updatedAt = Date.now();
-    log(
-      `Total OpenAI tokens used: input ${record.openAiUsage.inputTokens}, output ${record.openAiUsage.outputTokens}, total ${record.openAiUsage.totalTokens}.`,
-    );
-    log(
-      `Total Anthropic tokens used: input ${record.anthropicUsage.inputTokens}, output ${record.anthropicUsage.outputTokens}, total ${record.anthropicUsage.totalTokens}.`,
-    );
-    log(
-      failedTopicSummaries.length === 0
-        ? "Job completed successfully."
-        : "Job completed partially; some topics need manual review.",
-    );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unexpected MCQ generation failure.";
     console.error(`[job ${jobId}]`, error);
     record.status = "failed";
     record.error = message;
+    const status = getErrorStatus(error);
+    if (status === 529 && Array.isArray(record.generatedTopics) && record.generatedTopics.length > 0) {
+      record.allowValidationRetry = true;
+      log("Anthropic returned overloaded; validation can be retried without regenerating MCQs.");
+    } else {
+      record.allowValidationRetry = false;
+    }
     record.updatedAt = Date.now();
     log("Job failed:", message);
     log(
@@ -862,6 +919,68 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
     log(
       `Total Anthropic tokens used before failure: input ${record.anthropicUsage.inputTokens}, output ${record.anthropicUsage.outputTokens}, total ${record.anthropicUsage.totalTokens}.`,
     );
+  }
+}
+
+async function retryValidation(jobId: string, record: JobRecord): Promise<void> {
+  record.status = "processing";
+  record.updatedAt = Date.now();
+
+  const log = (...args: unknown[]) => logJob(record, jobId, ...args);
+  log("Validation retry started.");
+
+  try {
+    const {
+      chapterNumber,
+      chapterTitle,
+      classLevel,
+      subject,
+      syllabus,
+    } = record.payload;
+
+    if (!subject || typeof subject.id !== "number") {
+      throw new Error("Subject information missing in job payload.");
+    }
+
+    if (!syllabus || typeof syllabus.name !== "string") {
+      throw new Error("Syllabus information missing in job payload.");
+    }
+
+    if (!Array.isArray(record.generatedTopics) || record.generatedTopics.length === 0) {
+      throw new Error("No generated MCQs available for validation retry.");
+    }
+
+    record.allowValidationRetry = false;
+
+    await validateAndFinalizeJob({
+      jobId,
+      record,
+      generatedTopics: record.generatedTopics.map((topic) => ({
+        topic: topic.topic,
+        items: topic.items.map((item) => cloneMcqItem(item)),
+      })),
+      classLevel,
+      subject,
+      syllabus,
+      chapterNumber,
+      chapterTitle,
+      log,
+    });
+
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Validation retry failed.";
+    console.error(`[job ${jobId}] validation retry`, error);
+    record.status = "failed";
+    record.error = message;
+    const status = getErrorStatus(error);
+    if (status === 529 && Array.isArray(record.generatedTopics) && record.generatedTopics.length > 0) {
+      record.allowValidationRetry = true;
+      log("Anthropic returned overloaded during retry; validation can be attempted again.");
+    } else {
+      record.allowValidationRetry = false;
+    }
+    record.updatedAt = Date.now();
+    log("Validation retry failed:", message);
   }
 }
 
@@ -879,11 +998,15 @@ function createJob(payload: JobPayload): JobRecord {
     summary: null,
     openAiUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     anthropicUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    generatedTopics: undefined,
+    allowValidationRetry: false,
   };
 
   jobStore.set(jobId, record);
   return record;
 }
+
+globalThis.__mcqRetryValidation = retryValidation;
 
 export async function POST(request: NextRequest) {
   try {

@@ -5,11 +5,8 @@ export default function Home() {
     <div className="page">
       <main className="container">
         <header className="hero">
-          <h1>Chapter Topic Splitter</h1>
-          <p>
-            Upload an entire book PDF, specify the chapter, and let OpenAI craft 6-10
-            focused topics for you.
-          </p>
+      <h1>QFac</h1>
+      <p>Clarytix&apos;s Proprietary Question Generator Model</p>
         </header>
         <TopicSplitForm />
       </main>

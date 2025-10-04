@@ -37,6 +37,7 @@ interface StatusResponse {
   error?: string | null;
   openAiUsage?: TokenUsageTotals;
   anthropicUsage?: TokenUsageTotals;
+  allowValidationRetry?: boolean;
 }
 
 const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB limit for safety.
@@ -65,10 +66,12 @@ export default function TopicSplitForm() {
   const [syllabusesLoading, setSyllabusesLoading] = useState(false);
   const [syllabusesError, setSyllabusesError] = useState<string | null>(null);
   const [selectedSyllabus, setSelectedSyllabus] = useState<SyllabusOption | null>(null);
+  const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
   const [jobLogs, setJobLogs] = useState<string[]>([]);
   const [openAiUsage, setOpenAiUsage] = useState<TokenUsageTotals | null>(null);
   const [anthropicUsage, setAnthropicUsage] = useState<TokenUsageTotals | null>(null);
+  const [allowValidationRetry, setAllowValidationRetry] = useState(false);
 
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -123,6 +126,84 @@ export default function TopicSplitForm() {
       setPdfFile(file);
     },
     [],
+  );
+
+  const startJobPolling = useCallback(
+    async (jobIdentifier: string) => {
+      const poll = async () => {
+        try {
+          const statusResponse = await fetch(`/api/mcqs/status?jobId=${jobIdentifier}`);
+          const statusPayload = (await statusResponse.json().catch(() => null)) as
+            | (StatusResponse & { logs?: string[] })
+            | null;
+
+          if (!statusResponse.ok || !statusPayload) {
+            throw new Error(statusPayload?.error ?? "Unable to poll MCQ job status.");
+          }
+
+          setJobStatus(statusPayload.status);
+          setJobLogs(Array.isArray(statusPayload.logs) ? statusPayload.logs : []);
+          setOpenAiUsage(statusPayload.openAiUsage ?? null);
+          setAnthropicUsage(statusPayload.anthropicUsage ?? null);
+          setAllowValidationRetry(Boolean(statusPayload.allowValidationRetry));
+
+          if (statusPayload.status === "succeeded") {
+            const openAiTotal = statusPayload.openAiUsage?.totalTokens ?? 0;
+            const anthropicTotal = statusPayload.anthropicUsage?.totalTokens ?? 0;
+            setMcqStatus(
+              `Validation succeeded. Tokens — OpenAI ${openAiTotal}, Anthropic ${anthropicTotal}. Preparing download…`,
+            );
+            resetJobPolling();
+
+            const resultResponse = await fetch(`/api/mcqs/result?jobId=${jobIdentifier}`);
+
+            if (!resultResponse.ok) {
+              const problem = await resultResponse.json().catch(() => null);
+              throw new Error(problem?.error ?? "Unable to retrieve MCQ results.");
+            }
+
+            const blob = await resultResponse.blob();
+            const downloadUrl = URL.createObjectURL(blob);
+            const anchor = document.createElement("a");
+            anchor.href = downloadUrl;
+            anchor.download = `chapter-${chapterNumber}-mcqs.csv`;
+            document.body.append(anchor);
+            anchor.click();
+            anchor.remove();
+            URL.revokeObjectURL(downloadUrl);
+
+            setMcqStatus("All MCQ sets generated and download started.");
+            setIsGeneratingMcqs(false);
+          } else if (statusPayload.status === "failed") {
+            resetJobPolling();
+            setMcqError(statusPayload.error ?? "MCQ generation failed.");
+            setMcqStatus(null);
+            setIsGeneratingMcqs(false);
+          } else {
+            setMcqStatus(
+              statusPayload.status === "processing"
+                ? `Validation in progress for Class ${selectedClass} – ${selectedSubject?.name ?? ""}…`
+                : "Job queued…",
+            );
+          }
+        } catch (cause) {
+          resetJobPolling();
+          setMcqError(cause instanceof Error ? cause.message : "Unable to poll MCQ job.");
+          setMcqStatus(null);
+          setAllowValidationRetry(false);
+          setIsGeneratingMcqs(false);
+        }
+      };
+
+      await poll();
+      pollIntervalRef.current = setInterval(poll, 2000);
+    },
+    [
+      chapterNumber,
+      resetJobPolling,
+      selectedClass,
+      selectedSubject,
+    ],
   );
 
   const handleSubmit = useCallback(
@@ -328,12 +409,14 @@ export default function TopicSplitForm() {
     setMcqError(null);
     setMcqStatus(`Queued MCQ generation job for Class ${selectedClass} – ${selectedSubject.name}…`);
     setJobStatus(null);
-      setJobLogs([]);
-      setOpenAiUsage(null);
-      setAnthropicUsage(null);
+    setJobLogs([]);
+    setOpenAiUsage(null);
+    setAnthropicUsage(null);
+    setAllowValidationRetry(false);
+    setJobId(null);
 
-      try {
-        const response = await fetch("/api/mcqs", {
+    try {
+      const response = await fetch("/api/mcqs", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -364,78 +447,13 @@ export default function TopicSplitForm() {
         throw new Error(payload?.error ?? "Failed to queue MCQ generation.");
       }
 
+      setJobId(payload.jobId);
       setJobStatus("pending");
-
-      const poll = async () => {
-        try {
-          const statusResponse = await fetch(`/api/mcqs/status?jobId=${payload.jobId}`);
-          const statusPayload = (await statusResponse.json().catch(() => null)) as
-            | (StatusResponse & { logs?: string[] })
-            | null;
-
-          if (!statusResponse.ok || !statusPayload) {
-            throw new Error(statusPayload?.error ?? "Unable to poll MCQ job status.");
-          }
-
-          setJobStatus(statusPayload.status);
-          setJobLogs(Array.isArray(statusPayload.logs) ? statusPayload.logs : []);
-          setOpenAiUsage(statusPayload.openAiUsage ?? null);
-          setAnthropicUsage(statusPayload.anthropicUsage ?? null);
-
-          if (statusPayload.status === "succeeded") {
-            const openAiTotal = statusPayload.openAiUsage?.totalTokens ?? 0;
-            const anthropicTotal = statusPayload.anthropicUsage?.totalTokens ?? 0;
-            setMcqStatus(
-              `Validation succeeded. Tokens — OpenAI ${openAiTotal}, Anthropic ${anthropicTotal}. Preparing download…`,
-            );
-            resetJobPolling();
-
-            const resultResponse = await fetch(`/api/mcqs/result?jobId=${payload.jobId}`);
-
-            if (!resultResponse.ok) {
-              const problem = await resultResponse
-                .json()
-                .catch(() => null);
-              throw new Error(problem?.error ?? "Unable to retrieve MCQ results.");
-            }
-
-            const blob = await resultResponse.blob();
-            const downloadUrl = URL.createObjectURL(blob);
-            const anchor = document.createElement("a");
-            anchor.href = downloadUrl;
-            anchor.download = `chapter-${chapterNumber}-mcqs.csv`;
-            document.body.append(anchor);
-            anchor.click();
-            anchor.remove();
-            URL.revokeObjectURL(downloadUrl);
-
-            setMcqStatus("All MCQ sets generated and download started.");
-            setIsGeneratingMcqs(false);
-          } else if (statusPayload.status === "failed") {
-            resetJobPolling();
-            setMcqError(statusPayload.error ?? "MCQ generation failed.");
-            setMcqStatus(null);
-            setIsGeneratingMcqs(false);
-          } else {
-            setMcqStatus(
-              statusPayload.status === "processing"
-                ? `Validation in progress for Class ${selectedClass} – ${selectedSubject.name}…`
-                : "Job queued…",
-            );
-          }
-        } catch (cause) {
-          resetJobPolling();
-          setMcqError(cause instanceof Error ? cause.message : "Unable to poll MCQ job.");
-          setMcqStatus(null);
-          setIsGeneratingMcqs(false);
-        }
-      };
-
-      await poll();
-      pollIntervalRef.current = setInterval(poll, 2000);
+      await startJobPolling(payload.jobId);
     } catch (cause) {
       setMcqError(cause instanceof Error ? cause.message : "Unexpected error while creating MCQs.");
       setMcqStatus(null);
+      setAllowValidationRetry(false);
       setIsGeneratingMcqs(false);
     }
   }, [
@@ -446,9 +464,48 @@ export default function TopicSplitForm() {
     selectedClass,
     selectedSubject,
     selectedSyllabus,
+    startJobPolling,
     topics,
     vectorStoreId,
   ]);
+
+  const handleRetryValidation = useCallback(async () => {
+    if (!jobId) {
+      return;
+    }
+
+    resetJobPolling();
+    setIsGeneratingMcqs(true);
+    setMcqError(null);
+    setMcqStatus("Retrying validation…");
+    setAllowValidationRetry(false);
+
+    try {
+      const response = await fetch("/api/mcqs/retry-validation", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ jobId }),
+      });
+
+      const payload = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        throw new Error((payload as { error?: string } | null)?.error ?? "Unable to retry validation.");
+      }
+
+      setJobStatus((payload as { status?: JobStatus | null })?.status ?? "processing");
+      setAllowValidationRetry(Boolean((payload as { allowValidationRetry?: boolean })?.allowValidationRetry));
+
+      await startJobPolling(jobId);
+    } catch (cause) {
+      setMcqError(cause instanceof Error ? cause.message : "Unexpected error while retrying validation.");
+      setMcqStatus(null);
+      setAllowValidationRetry(true);
+      setIsGeneratingMcqs(false);
+    }
+  }, [jobId, resetJobPolling, startJobPolling]);
 
   useEffect(() => {
     return () => {
@@ -607,6 +664,15 @@ export default function TopicSplitForm() {
           >
             {isGeneratingMcqs ? "Generating MCQs…" : "Download MCQs (CSV)"}
           </button>
+          {allowValidationRetry && jobId && (
+            <button
+              type="button"
+              onClick={handleRetryValidation}
+              disabled={isGeneratingMcqs}
+            >
+              {isGeneratingMcqs ? "Retrying validation…" : "Retry validation"}
+            </button>
+          )}
           {mcqStatus && !mcqError && <span className="status">{mcqStatus}</span>}
           {mcqError && <span className="status error">{mcqError}</span>}
         </div>

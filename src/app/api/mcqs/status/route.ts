@@ -27,5 +27,6 @@ export async function GET(request: NextRequest) {
     updatedAt: record.updatedAt,
     openAiUsage: record.openAiUsage,
     anthropicUsage: record.anthropicUsage,
+    allowValidationRetry: Boolean(record.allowValidationRetry),
   });
 }
