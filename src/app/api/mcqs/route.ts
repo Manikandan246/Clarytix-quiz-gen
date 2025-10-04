@@ -24,7 +24,7 @@ const MCQ_RUBRIC = `You are a K–12 curriculum expert and assessment designer.
 Goal: Generate high-quality MCQs strictly from the provided book PDF.
 
 Quantity per topic
-- Produce either 10 or 15 MCQs. Choose 15 only when the retrieved context clearly supports a deeper, more complex treatment; otherwise stay at 10.
+- Produce 10–15 MCQs (decide by topic size/complexity).
 - Keep questions varied and non-redundant.
 
 Diverse types (mix across the set)
@@ -784,9 +784,9 @@ async function generateMcqsForTopic(options: {
     throw new Error(`Model did not return any MCQs for topic "${topic.topic}".`);
   }
 
-  if (mcqs.length !== 10 && mcqs.length !== 15) {
+  if (mcqs.length < 10 || mcqs.length > 15) {
     throw new Error(
-      `Model returned ${mcqs.length} MCQs for topic "${topic.topic}". Provide exactly 10 or 15 items based on topic complexity.`,
+      `Model returned ${mcqs.length} MCQs for topic "${topic.topic}". Provide between 10 and 15 items based on topic complexity.`,
     );
   }
 
