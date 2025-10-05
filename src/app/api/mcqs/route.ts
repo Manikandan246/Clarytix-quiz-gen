@@ -93,6 +93,14 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function makeFilenamePart(raw: string, fallback: string): string {
+  const sanitized = raw
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/[^A-Za-z0-9_\-]/g, "");
+  return sanitized.length > 0 ? sanitized : fallback;
+}
+
 function getErrorStatus(error: unknown): number | null {
   if (!error) {
     return null;
@@ -505,7 +513,11 @@ async function validateAndFinalizeJob(options: {
     overallStatus: failedTopicSummaries.length === 0 ? "approved" : "mixed",
     topicSummaries: failedTopicSummaries.length === 0 ? [] : failedTopicSummaries,
   };
-  record.outputFilename = `chapter-${record.payload.chapterNumber}-mcqs.csv`;
+  const classPart = makeFilenamePart(`Class ${classLevel}`, "Class");
+  const subjectPart = makeFilenamePart(subject.name ?? "Subject", "Subject");
+  const chapterPart = makeFilenamePart(chapterTitle, "Chapter");
+  const syllabusPart = makeFilenamePart(syllabus.name ?? "Syllabus", "Syllabus");
+  record.outputFilename = `${classPart}_${subjectPart}_${chapterPart}_${syllabusPart}.csv`;
   record.status = failedTopicSummaries.length === 0 ? "succeeded" : "succeeded";
   record.error = failedTopicSummaries.length === 0
     ? undefined

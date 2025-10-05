@@ -38,6 +38,7 @@ interface StatusResponse {
   openAiUsage?: TokenUsageTotals;
   anthropicUsage?: TokenUsageTotals;
   allowValidationRetry?: boolean;
+  outputFilename?: string | null;
 }
 
 const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB limit for safety.
@@ -166,7 +167,12 @@ export default function TopicSplitForm() {
             const downloadUrl = URL.createObjectURL(blob);
             const anchor = document.createElement("a");
             anchor.href = downloadUrl;
-            anchor.download = `chapter-${chapterNumber}-mcqs.csv`;
+            const downloadName =
+              typeof statusPayload.outputFilename === "string"
+              && statusPayload.outputFilename.trim().length > 0
+                ? statusPayload.outputFilename.trim()
+                : `chapter-${chapterNumber}-mcqs.csv`;
+            anchor.download = downloadName;
             document.body.append(anchor);
             anchor.click();
             anchor.remove();

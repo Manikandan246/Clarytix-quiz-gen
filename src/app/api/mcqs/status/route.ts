@@ -28,5 +28,6 @@ export async function GET(request: NextRequest) {
     openAiUsage: record.openAiUsage,
     anthropicUsage: record.anthropicUsage,
     allowValidationRetry: Boolean(record.allowValidationRetry),
+    outputFilename: record.outputFilename ?? null,
   });
 }
