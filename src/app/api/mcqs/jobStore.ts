@@ -61,6 +61,7 @@ export interface JobRecord {
   anthropicUsage: TokenUsageTotals;
   generatedTopics?: StoredTopicMcqs[];
   allowValidationRetry?: boolean;
+  allowPersistenceRetry?: boolean;
 }
 
 export type JobStore = Map<string, JobRecord>;
@@ -68,6 +69,9 @@ export type JobStore = Map<string, JobRecord>;
 declare global {
   var __mcqJobStore: JobStore | undefined;
   var __mcqRetryValidation:
+    | ((jobId: string, record: JobRecord) => Promise<void>)
+    | undefined;
+  var __mcqRetryPersistence:
     | ((jobId: string, record: JobRecord) => Promise<void>)
     | undefined;
 }

@@ -498,6 +498,8 @@ async function validateAndFinalizeJob(options: {
     record.status = "failed";
     record.error = "Failed to persist MCQs to the database.";
     record.allowValidationRetry = false;
+    record.allowPersistenceRetry = Array.isArray(record.generatedTopics)
+      && record.generatedTopics.length > 0;
     record.updatedAt = Date.now();
     log(
       "Database persistence failed:",
@@ -523,6 +525,7 @@ async function validateAndFinalizeJob(options: {
     ? undefined
     : "One or more topics require manual review.";
   record.allowValidationRetry = false;
+  record.allowPersistenceRetry = false;
   record.updatedAt = Date.now();
   log(
     `Total OpenAI tokens used: input ${record.openAiUsage.inputTokens}, output ${record.openAiUsage.outputTokens}, total ${record.openAiUsage.totalTokens}.`,
@@ -851,6 +854,7 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
 
     record.generatedTopics = undefined;
     record.allowValidationRetry = false;
+    record.allowPersistenceRetry = false;
 
     const generatedTopics: StoredTopicMcqs[] = [];
 
@@ -919,9 +923,11 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
     const status = getErrorStatus(error);
     if (status === 529 && Array.isArray(record.generatedTopics) && record.generatedTopics.length > 0) {
       record.allowValidationRetry = true;
+      record.allowPersistenceRetry = true;
       log("Anthropic returned overloaded; validation can be retried without regenerating MCQs.");
     } else {
       record.allowValidationRetry = false;
+      record.allowPersistenceRetry = Array.isArray(record.generatedTopics) && record.generatedTopics.length > 0;
     }
     record.updatedAt = Date.now();
     log("Job failed:", message);
@@ -963,6 +969,7 @@ async function retryValidation(jobId: string, record: JobRecord): Promise<void> 
     }
 
     record.allowValidationRetry = false;
+    record.allowPersistenceRetry = false;
 
     await validateAndFinalizeJob({
       jobId,
@@ -987,12 +994,79 @@ async function retryValidation(jobId: string, record: JobRecord): Promise<void> 
     const status = getErrorStatus(error);
     if (status === 529 && Array.isArray(record.generatedTopics) && record.generatedTopics.length > 0) {
       record.allowValidationRetry = true;
+      record.allowPersistenceRetry = false;
       log("Anthropic returned overloaded during retry; validation can be attempted again.");
     } else {
       record.allowValidationRetry = false;
+      record.allowPersistenceRetry = false;
     }
     record.updatedAt = Date.now();
     log("Validation retry failed:", message);
+  }
+}
+
+async function retryPersistence(jobId: string, record: JobRecord): Promise<void> {
+  record.status = "processing";
+  record.updatedAt = Date.now();
+
+  const log = (...args: unknown[]) => logJob(record, jobId, ...args);
+  log("Persistence retry started.");
+
+  try {
+    const {
+      chapterNumber,
+      chapterTitle,
+      classLevel,
+      subject,
+      syllabus,
+    } = record.payload;
+
+    if (!subject || typeof subject.id !== "number") {
+      throw new Error("Subject information missing in job payload.");
+    }
+
+    if (!syllabus || typeof syllabus.name !== "string") {
+      throw new Error("Syllabus information missing in job payload.");
+    }
+
+    if (!Array.isArray(record.generatedTopics) || record.generatedTopics.length === 0) {
+      throw new Error("No generated MCQs available for persistence retry.");
+    }
+
+    record.allowValidationRetry = false;
+    record.allowPersistenceRetry = false;
+
+    await validateAndFinalizeJob({
+      jobId,
+      record,
+      generatedTopics: record.generatedTopics.map((topic) => ({
+        topic: topic.topic,
+        items: topic.items.map((item) => cloneMcqItem(item)),
+      })),
+      classLevel,
+      subject,
+      syllabus,
+      chapterNumber,
+      chapterTitle,
+      log,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Persistence retry failed.";
+    console.error(`[job ${jobId}] persistence retry`, error);
+    record.status = "failed";
+    record.error = message;
+    const status = getErrorStatus(error);
+    if (status === 529 && Array.isArray(record.generatedTopics) && record.generatedTopics.length > 0) {
+      record.allowValidationRetry = true;
+      record.allowPersistenceRetry = true;
+      log("Anthropic returned overloaded during persistence retry; validation can be attempted again.");
+    } else {
+      const canRetry = Array.isArray(record.generatedTopics) && record.generatedTopics.length > 0;
+      record.allowValidationRetry = false;
+      record.allowPersistenceRetry = canRetry;
+    }
+    record.updatedAt = Date.now();
+    log("Persistence retry failed:", message);
   }
 }
 
@@ -1012,6 +1086,7 @@ function createJob(payload: JobPayload): JobRecord {
     anthropicUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     generatedTopics: undefined,
     allowValidationRetry: false,
+    allowPersistenceRetry: false,
   };
 
   jobStore.set(jobId, record);
@@ -1019,6 +1094,7 @@ function createJob(payload: JobPayload): JobRecord {
 }
 
 globalThis.__mcqRetryValidation = retryValidation;
+globalThis.__mcqRetryPersistence = retryPersistence;
 
 export async function POST(request: NextRequest) {
   try {

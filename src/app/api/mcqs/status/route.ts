@@ -28,6 +28,7 @@ export async function GET(request: NextRequest) {
     openAiUsage: record.openAiUsage,
     anthropicUsage: record.anthropicUsage,
     allowValidationRetry: Boolean(record.allowValidationRetry),
+    allowPersistenceRetry: Boolean(record.allowPersistenceRetry),
     outputFilename: record.outputFilename ?? null,
   });
 }

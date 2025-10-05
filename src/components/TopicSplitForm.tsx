@@ -38,6 +38,7 @@ interface StatusResponse {
   openAiUsage?: TokenUsageTotals;
   anthropicUsage?: TokenUsageTotals;
   allowValidationRetry?: boolean;
+  allowPersistenceRetry?: boolean;
   outputFilename?: string | null;
 }
 
@@ -73,6 +74,7 @@ export default function TopicSplitForm() {
   const [openAiUsage, setOpenAiUsage] = useState<TokenUsageTotals | null>(null);
   const [anthropicUsage, setAnthropicUsage] = useState<TokenUsageTotals | null>(null);
   const [allowValidationRetry, setAllowValidationRetry] = useState(false);
+  const [allowPersistenceRetry, setAllowPersistenceRetry] = useState(false);
 
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -147,6 +149,7 @@ export default function TopicSplitForm() {
           setOpenAiUsage(statusPayload.openAiUsage ?? null);
           setAnthropicUsage(statusPayload.anthropicUsage ?? null);
           setAllowValidationRetry(Boolean(statusPayload.allowValidationRetry));
+          setAllowPersistenceRetry(Boolean(statusPayload.allowPersistenceRetry));
 
           if (statusPayload.status === "succeeded") {
             const openAiTotal = statusPayload.openAiUsage?.totalTokens ?? 0;
@@ -186,19 +189,20 @@ export default function TopicSplitForm() {
             setMcqStatus(null);
             setIsGeneratingMcqs(false);
           } else {
-            setMcqStatus(
-              statusPayload.status === "processing"
-                ? `Validation in progress for Class ${selectedClass} – ${selectedSubject?.name ?? ""}…`
-                : "Job queued…",
-            );
-          }
-        } catch (cause) {
-          resetJobPolling();
-          setMcqError(cause instanceof Error ? cause.message : "Unable to poll MCQ job.");
-          setMcqStatus(null);
-          setAllowValidationRetry(false);
-          setIsGeneratingMcqs(false);
+          setMcqStatus(
+            statusPayload.status === "processing"
+              ? `Validation in progress for Class ${selectedClass} – ${selectedSubject?.name ?? ""}…`
+              : "Job queued…",
+          );
         }
+      } catch (cause) {
+        resetJobPolling();
+        setMcqError(cause instanceof Error ? cause.message : "Unable to poll MCQ job.");
+        setMcqStatus(null);
+        setAllowValidationRetry(false);
+        setAllowPersistenceRetry(false);
+        setIsGeneratingMcqs(false);
+      }
       };
 
       await poll();
@@ -419,6 +423,7 @@ export default function TopicSplitForm() {
     setOpenAiUsage(null);
     setAnthropicUsage(null);
     setAllowValidationRetry(false);
+    setAllowPersistenceRetry(false);
     setJobId(null);
 
     try {
@@ -460,6 +465,7 @@ export default function TopicSplitForm() {
       setMcqError(cause instanceof Error ? cause.message : "Unexpected error while creating MCQs.");
       setMcqStatus(null);
       setAllowValidationRetry(false);
+      setAllowPersistenceRetry(false);
       setIsGeneratingMcqs(false);
     }
   }, [
@@ -509,6 +515,48 @@ export default function TopicSplitForm() {
       setMcqError(cause instanceof Error ? cause.message : "Unexpected error while retrying validation.");
       setMcqStatus(null);
       setAllowValidationRetry(true);
+      setAllowPersistenceRetry(false);
+      setIsGeneratingMcqs(false);
+    }
+  }, [jobId, resetJobPolling, startJobPolling]);
+
+  const handleRetryPersistence = useCallback(async () => {
+    if (!jobId) {
+      return;
+    }
+
+    resetJobPolling();
+    setIsGeneratingMcqs(true);
+    setMcqError(null);
+    setMcqStatus("Retrying database save…");
+    setAllowValidationRetry(false);
+    setAllowPersistenceRetry(false);
+
+    try {
+      const response = await fetch("/api/mcqs/retry-persist", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ jobId }),
+      });
+
+      const payload = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        throw new Error((payload as { error?: string } | null)?.error ?? "Unable to retry persistence.");
+      }
+
+      setJobStatus((payload as { status?: JobStatus | null })?.status ?? "processing");
+      setAllowValidationRetry(Boolean((payload as { allowValidationRetry?: boolean })?.allowValidationRetry));
+      setAllowPersistenceRetry(Boolean((payload as { allowPersistenceRetry?: boolean })?.allowPersistenceRetry));
+
+      await startJobPolling(jobId);
+    } catch (cause) {
+      setMcqError(cause instanceof Error ? cause.message : "Unexpected error while retrying database save.");
+      setMcqStatus(null);
+      setAllowValidationRetry(false);
+      setAllowPersistenceRetry(true);
       setIsGeneratingMcqs(false);
     }
   }, [jobId, resetJobPolling, startJobPolling]);
@@ -677,6 +725,15 @@ export default function TopicSplitForm() {
               disabled={isGeneratingMcqs}
             >
               {isGeneratingMcqs ? "Retrying validation…" : "Retry validation"}
+            </button>
+          )}
+          {allowPersistenceRetry && jobId && (
+            <button
+              type="button"
+              onClick={handleRetryPersistence}
+              disabled={isGeneratingMcqs}
+            >
+              {isGeneratingMcqs ? "Retrying database save…" : "Retry database save"}
             </button>
           )}
           {mcqStatus && !mcqError && <span className="status">{mcqStatus}</span>}
