@@ -597,8 +597,8 @@ async function persistChapterToDatabase(options: {
       }
     } else {
       const insertedChapter = await client.query<{ id: number }>(
-        `INSERT INTO chapters (subject_id, class, chapter_name, syllabus)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO chapters (subject_id, class, chapter_name, syllabus, datecreated)
+         VALUES ($1, $2, $3, $4, NOW())
          RETURNING id`,
         [subjectId, classLabel, normalizedChapterTitle, normalizedSyllabus],
       );
