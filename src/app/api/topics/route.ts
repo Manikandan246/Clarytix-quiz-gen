@@ -3,6 +3,7 @@ import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { type NextRequest, NextResponse } from "next/server";
 import { toFile } from "openai/uploads";
 import { getOpenAIClient } from "@/lib/openai";
+import { summarizeVectorStoreFiles } from "@/lib/vectorStore";
 
 export const runtime = "nodejs";
 
@@ -10,6 +11,29 @@ const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024;
 const MODEL = "gpt-4.1";
 
 const MAX_FILE_RETENTION_MS = 60 * 60 * 1000; // keep cached uploads for 1 hour.
+const VECTOR_STORE_EXPIRATION_DAYS = 2;
+
+type OpenAIClient = NonNullable<ReturnType<typeof getOpenAIClient>>;
+
+async function validateCachedVectorStore(openai: OpenAIClient, vectorStoreId: string) {
+  const store = await openai.vectorStores.retrieve(vectorStoreId);
+  const summary = await summarizeVectorStoreFiles(openai, vectorStoreId);
+
+  if (store.status === "expired") {
+    throw new Error("Vector store has expired.");
+  }
+
+  if (summary.completed.length === 0) {
+    const messageParts = [
+      `completed=${summary.completed.length}`,
+      `pending=${summary.pending.length}`,
+      `failed=${summary.failed.length}`,
+    ];
+    throw new Error(`Vector store contains no completed files (${messageParts.join(", ")}).`);
+  }
+
+  return summary;
+}
 
 type CachedStore = {
   uploadedAt: number;
@@ -82,7 +106,19 @@ export async function POST(request: NextRequest) {
     let vectorStoreId: string | null = null;
 
     if (existing && Date.now() - existing.uploadedAt < MAX_FILE_RETENTION_MS) {
-      vectorStoreId = existing.vectorStoreId;
+      try {
+        const summary = await validateCachedVectorStore(openai, existing.vectorStoreId);
+        vectorStoreId = existing.vectorStoreId;
+        console.log(
+          `[topics] Reusing cached vector store ${existing.vectorStoreId} (completed files: ${summary.completed.join(", ")}).`,
+        );
+      } catch (error) {
+        console.warn(
+          `[topics] Cached vector store ${existing.vectorStoreId} is not reusable; removing from cache.`,
+          error,
+        );
+        storeCache.delete(cacheKey);
+      }
     }
 
     if (!vectorStoreId) {
@@ -103,17 +139,44 @@ export async function POST(request: NextRequest) {
 
       const vectorStore = await openai.vectorStores.create({
         name: `book-${filename}`.slice(0, 63),
+        expires_after: {
+          anchor: "last_active_at",
+          days: VECTOR_STORE_EXPIRATION_DAYS,
+        },
       });
 
-      await openai.vectorStores.files.uploadAndPoll(vectorStore.id, uploadable);
-
-      vectorStoreId = vectorStore.id;
-
-      if (cacheKey) {
-        storeCache.set(cacheKey, {
-          uploadedAt: Date.now(),
-          vectorStoreId,
+      try {
+        const batch = await openai.vectorStores.fileBatches.uploadAndPoll(vectorStore.id, {
+          files: [uploadable],
         });
+        console.log(`[topics] File batch ${batch.id} uploaded to vector store ${vectorStore.id}.`);
+        const summary = await summarizeVectorStoreFiles(openai, vectorStore.id);
+
+        if (summary.completed.length === 0) {
+          const details = `pending=${summary.pending.length}, failed=${summary.failed.length}`;
+          throw new Error(`Uploaded book did not finish indexing (${details}).`);
+        }
+
+        vectorStoreId = vectorStore.id;
+
+        if (cacheKey) {
+          storeCache.set(cacheKey, {
+            uploadedAt: Date.now(),
+            vectorStoreId,
+          });
+        }
+
+        console.log(
+          `[topics] Vector store ${vectorStore.id} ready with completed file IDs: ${summary.completed.join(", ")}`,
+        );
+      } catch (error) {
+        console.error("[topics] Upload failed; deleting vector store", error);
+        try {
+          await openai.vectorStores.del(vectorStore.id);
+        } catch (cleanupError) {
+          console.warn("[topics] Failed to delete vector store after upload failure", cleanupError);
+        }
+        throw error;
       }
     }
 

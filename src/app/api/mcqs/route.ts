@@ -6,6 +6,7 @@ import {
   type ReplacementMcq,
 } from "@/lib/anthropic";
 import { getOpenAIClient } from "@/lib/openai";
+import { summarizeVectorStoreFiles } from "@/lib/vectorStore";
 import {
   type JobPayload,
   type JobRecord,
@@ -342,6 +343,33 @@ function cloneMcqItem(item: StoredMcqItem): StoredMcqItem {
     options: [...item.options],
     source_spans: item.source_spans?.map((span) => ({ ...span })),
   };
+}
+
+async function ensureVectorStoreHasFiles(
+  openai: OpenAIClient,
+  vectorStoreId: string,
+): Promise<{ completedCount: number; completedFileIds: string[] }> {
+  const store = await openai.vectorStores.retrieve(vectorStoreId);
+  if (store.status === "expired") {
+    const error = new Error(
+      "Uploaded book reference has expired. Regenerate chapter topics to re-upload the PDF.",
+    );
+    Object.assign(error, { status: 410 });
+    throw error;
+  }
+
+  const summary = await summarizeVectorStoreFiles(openai, vectorStoreId);
+  const completedFiles = summary.completed.length;
+
+  if (completedFiles === 0) {
+    const error = new Error(
+      "Uploaded book reference is no longer available. Regenerate chapter topics to re-upload the PDF.",
+    );
+    Object.assign(error, { status: 410 });
+    throw error;
+  }
+
+  return { completedCount: completedFiles, completedFileIds: summary.completed };
 }
 
 async function validateAndFinalizeJob(options: {
@@ -746,36 +774,50 @@ async function generateMcqsForTopic(options: {
   const instructions = buildInstructionPrompt(topic, chapterNumber, chapterTitle, topicIndex, totalTopics);
   const userPrompt = buildUserPrompt(topic);
 
-  const response = await openai.responses.create({
-    model: MODEL,
-    instructions,
-    input: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: userPrompt,
-          },
-        ],
+  let response;
+  try {
+    response = await openai.responses.create({
+      model: MODEL,
+      instructions,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: userPrompt,
+            },
+          ],
+        },
+      ],
+      tool_choice: "auto",
+      tools: [
+        {
+          type: "file_search",
+          vector_store_ids: [vectorStoreId],
+        },
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: `mcq_batch_topic_${topicIndex + 1}`,
+          schema: buildJsonSchema(),
+          strict: true,
+        },
       },
-    ],
-    tool_choice: "auto",
-    tools: [
-      {
-        type: "file_search",
-        vector_store_ids: [vectorStoreId],
-      },
-    ],
-    text: {
-      format: {
-        type: "json_schema",
-        name: `mcq_batch_topic_${topicIndex + 1}`,
-        schema: buildJsonSchema(),
-        strict: true,
-      },
-    },
-  });
+    });
+  } catch (error) {
+    const status = getErrorStatus(error);
+    const message = error instanceof Error ? error.message : "";
+    if (status === 404 && typeof message === "string" && message.includes("No file found")) {
+      const rewritten = new Error(
+        "Uploaded book reference became unavailable during MCQ generation. Regenerate chapter topics to re-upload the PDF.",
+      );
+      Object.assign(rewritten, { status: 410 });
+      throw rewritten;
+    }
+    throw error;
+  }
 
   const output = response.output_text?.trim();
 
@@ -851,6 +893,11 @@ async function processJob(jobId: string, record: JobRecord): Promise<void> {
     if (!openai) {
       throw new Error("OPENAI_API_KEY is not configured on the server.");
     }
+
+    const { completedCount, completedFileIds } = await ensureVectorStoreHasFiles(openai, vectorStoreId);
+    log(
+      `Validated vector store ${vectorStoreId} before MCQ generation (${completedCount} completed files: ${completedFileIds.join(", ")}).`,
+    );
 
     record.generatedTopics = undefined;
     record.allowValidationRetry = false;
